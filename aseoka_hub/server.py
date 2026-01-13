@@ -62,6 +62,8 @@ class HeartbeatRequest(BaseModel):
 
     agent_id: str
     health_score: int = Field(default=0, ge=0, le=100)
+    active_issues: int = Field(default=0, ge=0)
+    pending_fixes: int = Field(default=0, ge=0)
 
 
 class HeartbeatResponse(BaseModel):
@@ -82,6 +84,8 @@ class AgentResponse(BaseModel):
     tier: str
     status: str
     health_score: int
+    active_issues: int = 0
+    pending_fixes: int = 0
     last_heartbeat: str | None
     registered_at: str | None
     has_repo_access: bool
@@ -566,6 +570,8 @@ async def get_agent(agent_id: str) -> AgentResponse:
         tier=agent.tier,
         status=agent.status,
         health_score=agent.health_score,
+        active_issues=agent.active_issues,
+        pending_fixes=agent.pending_fixes,
         last_heartbeat=agent.last_heartbeat.isoformat() if agent.last_heartbeat else None,
         registered_at=agent.registered_at.isoformat() if agent.registered_at else None,
         has_repo_access=agent.has_repo_access,
@@ -595,6 +601,8 @@ async def list_agents(client_id: str | None = None, status: str | None = None) -
             tier=a.tier,
             status=a.status,
             health_score=a.health_score,
+            active_issues=a.active_issues,
+            pending_fixes=a.pending_fixes,
             last_heartbeat=a.last_heartbeat.isoformat() if a.last_heartbeat else None,
             registered_at=a.registered_at.isoformat() if a.registered_at else None,
             has_repo_access=a.has_repo_access,
@@ -611,13 +619,30 @@ async def heartbeat(request: HeartbeatRequest) -> HeartbeatResponse:
     """Process agent heartbeat."""
     db = get_db()
 
-    updated = await db.update_heartbeat(request.agent_id, request.health_score)
+    updated = await db.update_heartbeat(
+        request.agent_id,
+        request.health_score,
+        active_issues=request.active_issues,
+        pending_fixes=request.pending_fixes,
+    )
 
     if not updated:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=f"Agent {request.agent_id} not found",
         )
+
+    # Broadcast state update to connected dashboards
+    await broadcast_to_dashboards({
+        "type": "agent_state_update",
+        "agent_id": request.agent_id,
+        "data": {
+            "health_score": request.health_score,
+            "active_issues": request.active_issues,
+            "pending_fixes": request.pending_fixes,
+        },
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    })
 
     return HeartbeatResponse(
         acknowledged=True,
@@ -1222,9 +1247,27 @@ async def agent_websocket(
             _agent_last_seen[agent_id] = datetime.now(timezone.utc)
 
             if msg_type == "heartbeat":
-                # Update heartbeat in database
+                # Update heartbeat in database (including active_issues and pending_fixes)
                 health_score = msg_data.get("health_score", 0)
-                await db.update_heartbeat(agent_id, health_score)
+                active_issues = msg_data.get("active_issues", 0)
+                pending_fixes = msg_data.get("pending_fixes", 0)
+                await db.update_heartbeat(
+                    agent_id,
+                    health_score,
+                    active_issues=active_issues,
+                    pending_fixes=pending_fixes,
+                )
+
+                # Broadcast health update to connected dashboards
+                await broadcast_to_dashboards({
+                    "type": "agent_state_update",
+                    "agent_id": agent_id,
+                    "data": {
+                        "health_score": health_score,
+                        "active_issues": active_issues,
+                        "pending_fixes": pending_fixes,
+                    },
+                })
 
                 # Send acknowledgment
                 await websocket.send_text(json.dumps({
@@ -1338,12 +1381,27 @@ async def dashboard_websocket(websocket: WebSocket) -> None:
         all_agents = await db.get_all_agents()
         online_agents = [a for a in all_agents if a.status == "online"]
 
+        # Build agents array with health data for dashboard
+        agents_data = [
+            {
+                "agent_id": a.agent_id,
+                "site_url": a.site_url,
+                "site_name": a.site_name,
+                "status": a.status,
+                "health_score": a.health_score or 0,
+                "active_issues": a.active_issues or 0,
+                "pending_fixes": a.pending_fixes or 0,
+            }
+            for a in all_agents
+        ]
+
         await websocket.send_text(json.dumps({
             "type": "initial_stats",
             "data": {
                 "total_agents": len(all_agents),
                 "online_agents": len(online_agents),
                 "connected_agent_ids": get_connected_agent_ids(),
+                "agents": agents_data,
                 "timestamp": datetime.now(timezone.utc).isoformat(),
             },
         }))

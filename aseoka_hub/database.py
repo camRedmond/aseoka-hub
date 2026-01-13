@@ -40,6 +40,8 @@ class Agent:
     tier: Literal["starter", "pro", "enterprise"] = "starter"
     status: Literal["online", "offline", "error"] = "offline"
     health_score: int = 0
+    active_issues: int = 0
+    pending_fixes: int = 0
     last_heartbeat: datetime | None = None
     last_full_report: datetime | None = None
     registered_at: datetime | None = None
@@ -133,6 +135,8 @@ CREATE TABLE IF NOT EXISTS agents (
     tier TEXT DEFAULT 'starter',
     status TEXT DEFAULT 'offline',
     health_score INTEGER DEFAULT 0,
+    active_issues INTEGER DEFAULT 0,
+    pending_fixes INTEGER DEFAULT 0,
     last_heartbeat TIMESTAMP,
     last_full_report TIMESTAMP,
     registered_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
@@ -321,9 +325,9 @@ class HubDatabase:
         await self._connection.execute(
             """INSERT INTO agents
                (agent_id, client_id, site_url, site_name, platform, tier, status,
-                health_score, last_heartbeat, registered_at, callback_url,
+                health_score, active_issues, pending_fixes, last_heartbeat, registered_at, callback_url,
                 has_repo_access, has_github_access, llm_provider)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 agent.agent_id,
                 agent.client_id,
@@ -333,6 +337,8 @@ class HubDatabase:
                 agent.tier,
                 agent.status,
                 agent.health_score,
+                agent.active_issues,
+                agent.pending_fixes,
                 now,
                 now,
                 agent.callback_url,
@@ -387,12 +393,20 @@ class HubDatabase:
 
         return [self._row_to_agent(row) for row in rows]
 
-    async def update_heartbeat(self, agent_id: str, health_score: int = 0) -> bool:
+    async def update_heartbeat(
+        self,
+        agent_id: str,
+        health_score: int = 0,
+        active_issues: int | None = None,
+        pending_fixes: int | None = None,
+    ) -> bool:
         """Update agent heartbeat.
 
         Args:
             agent_id: Agent ID
             health_score: Current health score
+            active_issues: Number of active issues (optional)
+            pending_fixes: Number of pending fixes (optional)
 
         Returns:
             True if agent exists and was updated
@@ -401,12 +415,23 @@ class HubDatabase:
             raise RuntimeError("Database not connected")
 
         now = datetime.now(timezone.utc).isoformat()
-        cursor = await self._connection.execute(
-            """UPDATE agents
-               SET last_heartbeat = ?, status = 'online', health_score = ?
-               WHERE agent_id = ?""",
-            (now, health_score, agent_id),
-        )
+
+        # Build the update query dynamically based on provided values
+        if active_issues is not None and pending_fixes is not None:
+            cursor = await self._connection.execute(
+                """UPDATE agents
+                   SET last_heartbeat = ?, status = 'online', health_score = ?,
+                       active_issues = ?, pending_fixes = ?
+                   WHERE agent_id = ?""",
+                (now, health_score, active_issues, pending_fixes, agent_id),
+            )
+        else:
+            cursor = await self._connection.execute(
+                """UPDATE agents
+                   SET last_heartbeat = ?, status = 'online', health_score = ?
+                   WHERE agent_id = ?""",
+                (now, health_score, agent_id),
+            )
         await self._connection.commit()
 
         updated = cursor.rowcount > 0
@@ -488,6 +513,8 @@ class HubDatabase:
             tier=row["tier"],
             status=row["status"],
             health_score=row["health_score"],
+            active_issues=row["active_issues"] if "active_issues" in row.keys() else 0,
+            pending_fixes=row["pending_fixes"] if "pending_fixes" in row.keys() else 0,
             last_heartbeat=datetime.fromisoformat(row["last_heartbeat"]) if row["last_heartbeat"] else None,
             last_full_report=datetime.fromisoformat(row["last_full_report"]) if row["last_full_report"] else None,
             registered_at=datetime.fromisoformat(row["registered_at"]) if row["registered_at"] else None,
