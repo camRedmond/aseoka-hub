@@ -371,6 +371,7 @@ class HubSettings:
     def __init__(self) -> None:
         import os
 
+        self.hub_db_path = os.environ.get("ASEOKA_HUB_DB_PATH", "hub.db")
         self.hub_jwt_secret = os.environ.get("ASEOKA_HUB_JWT_SECRET", "")
         self.hub_jwt_expiry_minutes = int(os.environ.get("ASEOKA_HUB_JWT_EXPIRY_MINUTES", "60"))
         self.hub_api_key_enabled = os.environ.get("ASEOKA_HUB_API_KEY_ENABLED", "true").lower() == "true"
@@ -398,7 +399,7 @@ async def lifespan(app: FastAPI):
 
     global _db, _playbook, _settings
     _settings = HubSettings()
-    _db = HubDatabase()
+    _db = HubDatabase(_settings.hub_db_path)
     await _db.connect()
 
     # Store in app.state for middleware access
@@ -527,7 +528,7 @@ async def get_client(client_id: str) -> ClientResponse:
 
 @app.post("/agents/register", response_model=RegisterAgentResponse, status_code=status.HTTP_201_CREATED)
 async def register_agent(request: RegisterAgentRequest) -> RegisterAgentResponse:
-    """Register a new agent."""
+    """Register a new agent or reconnect an existing one."""
     db = get_db()
 
     # Verify client exists
@@ -538,15 +539,39 @@ async def register_agent(request: RegisterAgentRequest) -> RegisterAgentResponse
             detail=f"Client {request.client_id} not found",
         )
 
-    # Check agent limit
+    # Check if an agent for this (client_id, site_url) already exists
     existing_agents = await db.get_agents_by_client(request.client_id)
+    existing_agent = next(
+        (a for a in existing_agents if a.site_url == request.site_url),
+        None
+    )
+
+    if existing_agent:
+        # Reconnect existing agent - update status to online
+        await db.update_agent_status(existing_agent.agent_id, "online")
+
+        logger.info(
+            "agent_reconnected",
+            agent_id=existing_agent.agent_id,
+            client_id=request.client_id,
+            site_url=request.site_url,
+        )
+
+        return RegisterAgentResponse(
+            agent_id=existing_agent.agent_id,
+            client_id=request.client_id,
+            site_url=request.site_url,
+            registered_at=existing_agent.registered_at.isoformat() if existing_agent.registered_at else datetime.now(timezone.utc).isoformat(),
+        )
+
+    # Check agent limit for new registrations
     if len(existing_agents) >= client.max_agents:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail=f"Client has reached maximum agents ({client.max_agents})",
         )
 
-    # Create agent
+    # Create new agent
     agent_id = generate_id("agent")
     now = datetime.now(timezone.utc)
 

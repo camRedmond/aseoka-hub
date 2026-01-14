@@ -55,6 +55,10 @@ def serve(
     """Start the ASEOKA hub server."""
     import uvicorn
     from aseoka_hub.server import app as hub_app
+    from aseoka_hub.logging import setup_logging
+
+    # Set up logging with noise reduction before uvicorn starts
+    setup_logging(level=log_level, filter_health_checks=True, rate_limit_noisy_logs=True)
 
     console.print(Panel.fit(
         f"[bold blue]ASEOKA Hub Server[/bold blue]\n\n"
