@@ -6,14 +6,14 @@ from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
-from fastapi import FastAPI, HTTPException, Query, WebSocket, WebSocketDisconnect, status
+from fastapi import FastAPI, HTTPException, Query, Request, WebSocket, WebSocketDisconnect, status
 from pydantic import BaseModel, Field
 
 from aseoka_hub.logging import get_logger
 from aseoka_hub.types import generate_id
 from aseoka_hub.auth import AuthInfo, TokenManager
 from aseoka_hub.database import HubDatabase, Agent, Client, Activity
-from aseoka_hub.middleware import AuthMiddleware
+from aseoka_hub.middleware import AuthMiddleware, get_auth_info
 from aseoka_hub.playbook import PlaybookManager, PlaybookEntry, PlaybookOutcome, CodeExample
 
 logger = get_logger(__name__)
@@ -21,8 +21,13 @@ logger = get_logger(__name__)
 
 # WebSocket connection tracking
 _connected_agents: dict[str, WebSocket] = {}
-_dashboard_subscribers: set[WebSocket] = set()
+# Dashboard subscribers now track client_id for multi-tenant filtering
+# Format: {websocket: {"client_id": str | None, "is_admin": bool}}
+_dashboard_subscribers: dict[WebSocket, dict[str, Any]] = {}
 _agent_last_seen: dict[str, datetime] = {}
+
+# Cache of agent_id -> client_id for efficient broadcast filtering
+_agent_client_map: dict[str, str] = {}
 
 
 # Request/Response models
@@ -274,23 +279,51 @@ class ProvisioningTokenResponse(BaseModel):
 # WebSocket helper functions
 
 
-async def broadcast_to_dashboards(message: dict[str, Any]) -> None:
-    """Broadcast a message to all connected dashboards."""
+async def broadcast_to_dashboards(
+    message: dict[str, Any],
+    agent_id: str | None = None,
+) -> None:
+    """Broadcast a message to connected dashboards with tenant filtering.
+
+    Args:
+        message: Message to broadcast
+        agent_id: If provided, only broadcast to dashboards belonging to
+                  the same client as this agent (admins see all)
+    """
     if not _dashboard_subscribers:
         return
 
-    msg_str = json.dumps(message)
-    disconnected = set()
+    # Determine which client should receive this message
+    target_client_id: str | None = None
+    if agent_id:
+        target_client_id = _agent_client_map.get(agent_id)
 
-    for ws in _dashboard_subscribers:
+    msg_str = json.dumps(message)
+    disconnected: set[WebSocket] = set()
+
+    # Send in parallel for better performance
+    async def send_to_subscriber(ws: WebSocket, sub_info: dict[str, Any]) -> None:
         try:
+            # Check if this subscriber should receive the message
+            if target_client_id:
+                sub_client_id = sub_info.get("client_id")
+                is_admin = sub_info.get("is_admin", False)
+                # Only send if admin or matching client
+                if not is_admin and sub_client_id != target_client_id:
+                    return
             await ws.send_text(msg_str)
         except Exception:
             disconnected.add(ws)
 
+    # Use asyncio.gather for parallel sends
+    await asyncio.gather(*[
+        send_to_subscriber(ws, info)
+        for ws, info in _dashboard_subscribers.items()
+    ])
+
     # Clean up disconnected subscribers
     for ws in disconnected:
-        _dashboard_subscribers.discard(ws)
+        _dashboard_subscribers.pop(ws, None)
 
 
 async def send_to_agent(agent_id: str, message: dict[str, Any]) -> bool:
@@ -344,6 +377,8 @@ class HubSettings:
         self.hub_mtls_enabled = os.environ.get("ASEOKA_HUB_MTLS_ENABLED", "false").lower() == "true"
         self.hub_require_auth = os.environ.get("ASEOKA_HUB_REQUIRE_AUTH", "true").lower() == "true"
         self.hub_ca_dir = os.environ.get("ASEOKA_HUB_CA_DIR", ".aseoka/ca")
+        # API docs disabled by default for security - enable explicitly in development
+        self.hub_docs_enabled = os.environ.get("ASEOKA_HUB_DOCS_ENABLED", "false").lower() == "true"
 
 
 _settings: HubSettings | None = None
@@ -403,11 +438,18 @@ async def lifespan(app: FastAPI):
 
 
 # Create FastAPI app
+# Docs are disabled by default for security - set ASEOKA_HUB_DOCS_ENABLED=true in dev
+import os as _os
+_docs_enabled = _os.environ.get("ASEOKA_HUB_DOCS_ENABLED", "false").lower() == "true"
+
 app = FastAPI(
     title="ASEOKA Hub",
     description="Central coordination server for ASEOKA agents",
     version="4.0.0",
     lifespan=lifespan,
+    docs_url="/docs" if _docs_enabled else None,
+    redoc_url="/redoc" if _docs_enabled else None,
+    openapi_url="/openapi.json" if _docs_enabled else None,
 )
 
 # Add authentication middleware
@@ -550,8 +592,11 @@ async def register_agent(request: RegisterAgentRequest) -> RegisterAgentResponse
 
 
 @app.get("/agents/{agent_id}", response_model=AgentResponse)
-async def get_agent(agent_id: str) -> AgentResponse:
-    """Get agent details."""
+async def get_agent(request: Request, agent_id: str) -> AgentResponse:
+    """Get agent details.
+
+    Non-admin users can only access agents belonging to their client.
+    """
     db = get_db()
     agent = await db.get_agent(agent_id)
 
@@ -560,6 +605,15 @@ async def get_agent(agent_id: str) -> AgentResponse:
             status_code=status.HTTP_404_NOT_FOUND,
             detail=f"Agent {agent_id} not found",
         )
+
+    # Check tenant isolation
+    auth_info = get_auth_info(request)
+    if auth_info and not auth_info.is_admin:
+        if not auth_info.can_access_agent(agent.client_id):
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Access denied: agent belongs to different client",
+            )
 
     return AgentResponse(
         agent_id=agent.agent_id,
@@ -580,12 +634,37 @@ async def get_agent(agent_id: str) -> AgentResponse:
 
 
 @app.get("/agents", response_model=list[AgentResponse])
-async def list_agents(client_id: str | None = None, status: str | None = None) -> list[AgentResponse]:
-    """List agents with optional filters."""
-    db = get_db()
+async def list_agents(
+    request: Request,
+    client_id: str | None = None,
+    status: str | None = None,
+) -> list[AgentResponse]:
+    """List agents with optional filters.
 
-    if client_id:
-        agents = await db.get_agents_by_client(client_id)
+    Non-admin users can only see agents belonging to their client.
+    Admins can see all agents or filter by client_id.
+    """
+    db = get_db()
+    auth_info = get_auth_info(request)
+
+    # Determine effective client_id filter based on auth
+    effective_client_id = client_id
+    if auth_info:
+        if not auth_info.is_admin:
+            # Non-admin users can only see their own client's agents
+            if not auth_info.client_id:
+                # No client_id in auth - return empty list for safety
+                return []
+            # Override any provided client_id with the authenticated user's client_id
+            effective_client_id = auth_info.client_id
+        # Admins can filter by any client_id or see all
+
+    # Fetch agents with appropriate filtering
+    if effective_client_id:
+        agents = await db.get_agents_by_client(effective_client_id)
+        # Apply status filter if provided
+        if status == "online":
+            agents = [a for a in agents if a.status == "online"]
     elif status == "online":
         agents = await db.get_online_agents()
     else:
@@ -654,18 +733,39 @@ async def heartbeat(request: HeartbeatRequest) -> HeartbeatResponse:
 
 @app.get("/activities")
 async def list_activities(
+    request: Request,
     agent_id: str | None = None,
     activity_type: str | None = None,
     limit: int = 100,
 ) -> list[dict[str, Any]]:
-    """List activities with optional filters."""
+    """List activities with optional filters.
+
+    Non-admin users can only see activities for their own agents.
+    """
     db = get_db()
+    auth_info = get_auth_info(request)
+
+    # If agent_id provided, verify access
+    if agent_id and auth_info and not auth_info.is_admin:
+        agent = await db.get_agent(agent_id)
+        if agent and not auth_info.can_access_agent(agent.client_id):
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Access denied: agent belongs to different client",
+            )
 
     activities = await db.get_activities(
         agent_id=agent_id,
         activity_type=activity_type,
         limit=min(limit, 1000),
     )
+
+    # Filter activities by accessible agents for non-admin users
+    if auth_info and not auth_info.is_admin and auth_info.client_id:
+        # Get all accessible agent IDs for this client
+        client_agents = await db.get_agents_by_client(auth_info.client_id)
+        accessible_agent_ids = {a.agent_id for a in client_agents}
+        activities = [a for a in activities if a.agent_id in accessible_agent_ids]
 
     return [
         {
@@ -678,6 +778,188 @@ async def list_activities(
         }
         for a in activities
     ]
+
+
+# Agent proxy endpoints - forward requests to agent's callback_url
+
+import httpx
+
+
+async def _proxy_to_agent(
+    agent_id: str,
+    method: str,
+    path: str,
+    json_body: dict | None = None,
+    auth_info: AuthInfo | None = None,
+) -> dict[str, Any]:
+    """Proxy a request to an agent's callback_url.
+
+    Args:
+        agent_id: Agent to send request to
+        method: HTTP method (GET, POST, etc.)
+        path: Path to append to callback_url
+        json_body: Optional JSON body for POST/PUT requests
+        auth_info: Auth info for tenant validation
+
+    Returns:
+        Response from agent as dict
+
+    Raises:
+        HTTPException: If agent not found, no callback_url, or request fails
+    """
+    db = get_db()
+    agent = await db.get_agent(agent_id)
+
+    if not agent:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Agent {agent_id} not found",
+        )
+
+    # Tenant isolation check
+    if auth_info and not auth_info.is_admin:
+        if not auth_info.can_access_agent(agent.client_id):
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Access denied: agent belongs to different client",
+            )
+
+    if not agent.callback_url:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Agent {agent_id} has no callback_url configured",
+        )
+
+    url = f"{agent.callback_url.rstrip('/')}{path}"
+
+    try:
+        async with httpx.AsyncClient(timeout=60.0) as client:
+            if method.upper() == "GET":
+                response = await client.get(url)
+            elif method.upper() == "POST":
+                response = await client.post(url, json=json_body or {})
+            else:
+                raise HTTPException(
+                    status_code=status.HTTP_405_METHOD_NOT_ALLOWED,
+                    detail=f"Method {method} not supported",
+                )
+
+            if response.status_code >= 400:
+                error_detail = response.text
+                try:
+                    error_detail = response.json().get("detail", response.text)
+                except Exception:
+                    pass
+                raise HTTPException(
+                    status_code=response.status_code,
+                    detail=f"Agent error: {error_detail}",
+                )
+
+            return response.json()
+
+    except httpx.TimeoutException:
+        raise HTTPException(
+            status_code=status.HTTP_504_GATEWAY_TIMEOUT,
+            detail=f"Request to agent {agent_id} timed out",
+        )
+    except httpx.RequestError as e:
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=f"Failed to connect to agent {agent_id}: {str(e)}",
+        )
+
+
+@app.get("/agents/{agent_id}/fixes")
+async def get_agent_fixes(
+    request: Request,
+    agent_id: str,
+) -> list[dict[str, Any]]:
+    """Get all fixes from an agent.
+
+    Proxies the request to the agent's /fixes endpoint.
+    """
+    auth_info = get_auth_info(request)
+    return await _proxy_to_agent(agent_id, "GET", "/fixes", auth_info=auth_info)
+
+
+@app.get("/agents/{agent_id}/fixes/{fix_id}")
+async def get_agent_fix_detail(
+    request: Request,
+    agent_id: str,
+    fix_id: str,
+) -> dict[str, Any]:
+    """Get detailed fix information from an agent.
+
+    Proxies the request to the agent's /fixes/{fix_id} endpoint.
+    Returns file changes, diff, confidence, and explanations.
+    """
+    auth_info = get_auth_info(request)
+    return await _proxy_to_agent(agent_id, "GET", f"/fixes/{fix_id}", auth_info=auth_info)
+
+
+class FixApprovalRequest(BaseModel):
+    """Request body for fix approval."""
+
+    comment: str | None = None
+
+
+class FixRejectionRequest(BaseModel):
+    """Request body for fix rejection."""
+
+    reason: str
+
+
+@app.post("/agents/{agent_id}/fixes/{fix_id}/approve")
+async def approve_agent_fix(
+    request: Request,
+    agent_id: str,
+    fix_id: str,
+    body: FixApprovalRequest | None = None,
+) -> dict[str, Any]:
+    """Approve a fix on an agent.
+
+    Proxies the request to the agent's /fixes/{fix_id}/approve endpoint.
+    This will create a PR for the fix.
+    """
+    auth_info = get_auth_info(request)
+    json_body = body.model_dump() if body else {}
+    return await _proxy_to_agent(
+        agent_id, "POST", f"/fixes/{fix_id}/approve", json_body=json_body, auth_info=auth_info
+    )
+
+
+@app.post("/agents/{agent_id}/fixes/{fix_id}/reject")
+async def reject_agent_fix(
+    request: Request,
+    agent_id: str,
+    fix_id: str,
+    body: FixRejectionRequest,
+) -> dict[str, Any]:
+    """Reject a fix on an agent.
+
+    Proxies the request to the agent's /fixes/{fix_id}/reject endpoint.
+    """
+    auth_info = get_auth_info(request)
+    return await _proxy_to_agent(
+        agent_id, "POST", f"/fixes/{fix_id}/reject", json_body=body.model_dump(), auth_info=auth_info
+    )
+
+
+@app.get("/agents/{agent_id}/issues")
+async def get_agent_issues(
+    request: Request,
+    agent_id: str,
+    status: str | None = None,
+) -> list[dict[str, Any]]:
+    """Get issues from an agent.
+
+    Proxies the request to the agent's /issues endpoint.
+    """
+    auth_info = get_auth_info(request)
+    path = "/issues"
+    if status:
+        path += f"?status={status}"
+    return await _proxy_to_agent(agent_id, "GET", path, auth_info=auth_info)
 
 
 # Playbook endpoints
@@ -1217,22 +1499,27 @@ async def agent_websocket(
     # Accept connection
     await websocket.accept()
 
-    # Register connection
+    # Register connection and cache client_id for broadcast filtering
     _connected_agents[agent_id] = websocket
     _agent_last_seen[agent_id] = datetime.now(timezone.utc)
+    _agent_client_map[agent_id] = agent.client_id
 
     # Update agent status
     await db.update_agent_status(agent_id, "online")
 
-    # Broadcast to dashboards
-    await broadcast_to_dashboards({
-        "type": "agent_connected",
-        "data": {
-            "agent_id": agent_id,
-            "site_url": agent.site_url,
-            "timestamp": datetime.now(timezone.utc).isoformat(),
+    # Broadcast to dashboards (filtered by client_id)
+    await broadcast_to_dashboards(
+        {
+            "type": "agent_connected",
+            "data": {
+                "agent_id": agent_id,
+                "site_url": agent.site_url,
+                "client_id": agent.client_id,
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+            },
         },
-    })
+        agent_id=agent_id,
+    )
 
     logger.info("agent_ws_connected", agent_id=agent_id)
 
@@ -1258,16 +1545,19 @@ async def agent_websocket(
                     pending_fixes=pending_fixes,
                 )
 
-                # Broadcast health update to connected dashboards
-                await broadcast_to_dashboards({
-                    "type": "agent_state_update",
-                    "agent_id": agent_id,
-                    "data": {
-                        "health_score": health_score,
-                        "active_issues": active_issues,
-                        "pending_fixes": pending_fixes,
+                # Broadcast health update to connected dashboards (filtered by client)
+                await broadcast_to_dashboards(
+                    {
+                        "type": "agent_state_update",
+                        "agent_id": agent_id,
+                        "data": {
+                            "health_score": health_score,
+                            "active_issues": active_issues,
+                            "pending_fixes": pending_fixes,
+                        },
                     },
-                })
+                    agent_id=agent_id,
+                )
 
                 # Send acknowledgment
                 await websocket.send_text(json.dumps({
@@ -1286,50 +1576,62 @@ async def agent_websocket(
                 )
                 await db.log_activity(activity)
 
-                # Broadcast to dashboards
-                await broadcast_to_dashboards({
-                    "type": "agent_activity",
-                    "data": {
-                        "agent_id": agent_id,
-                        "activity": msg_data,
+                # Broadcast to dashboards (filtered by client)
+                await broadcast_to_dashboards(
+                    {
+                        "type": "agent_activity",
+                        "data": {
+                            "agent_id": agent_id,
+                            "activity": msg_data,
+                        },
                     },
-                })
+                    agent_id=agent_id,
+                )
 
             elif msg_type == "state_update":
-                # Broadcast state change to dashboards
-                await broadcast_to_dashboards({
-                    "type": "agent_state_update",
-                    "data": {
-                        "agent_id": agent_id,
-                        "previous_state": msg_data.get("previous_state"),
-                        "new_state": msg_data.get("new_state"),
-                        "reason": msg_data.get("reason"),
+                # Broadcast state change to dashboards (filtered by client)
+                await broadcast_to_dashboards(
+                    {
+                        "type": "agent_state_update",
+                        "data": {
+                            "agent_id": agent_id,
+                            "previous_state": msg_data.get("previous_state"),
+                            "new_state": msg_data.get("new_state"),
+                            "reason": msg_data.get("reason"),
+                        },
                     },
-                })
+                    agent_id=agent_id,
+                )
 
             elif msg_type == "thought":
-                # Broadcast agent thought to dashboards
-                await broadcast_to_dashboards({
-                    "type": "agent_thought",
-                    "data": {
-                        "agent_id": agent_id,
-                        "thought": msg_data.get("thought"),
-                        "step": msg_data.get("step"),
-                        "confidence": msg_data.get("confidence"),
+                # Broadcast agent thought to dashboards (filtered by client)
+                await broadcast_to_dashboards(
+                    {
+                        "type": "agent_thought",
+                        "data": {
+                            "agent_id": agent_id,
+                            "thought": msg_data.get("thought"),
+                            "step": msg_data.get("step"),
+                            "confidence": msg_data.get("confidence"),
+                        },
                     },
-                })
+                    agent_id=agent_id,
+                )
 
             elif msg_type == "command_response":
-                # Response to a command from hub
-                await broadcast_to_dashboards({
-                    "type": "command_response",
-                    "data": {
-                        "agent_id": agent_id,
-                        "command_id": msg_data.get("command_id"),
-                        "result": msg_data.get("result"),
-                        "error": msg_data.get("error"),
+                # Response to a command from hub (filtered by client)
+                await broadcast_to_dashboards(
+                    {
+                        "type": "command_response",
+                        "data": {
+                            "agent_id": agent_id,
+                            "command_id": msg_data.get("command_id"),
+                            "result": msg_data.get("result"),
+                            "error": msg_data.get("error"),
+                        },
                     },
-                })
+                    agent_id=agent_id,
+                )
 
             elif msg_type == "pong":
                 # Response to ping, just update last seen
@@ -1343,7 +1645,7 @@ async def agent_websocket(
     except Exception as e:
         logger.error("agent_ws_error", agent_id=agent_id, error=str(e))
     finally:
-        # Cleanup connection
+        # Cleanup connection (keep client_id for disconnect broadcast)
         _connected_agents.pop(agent_id, None)
         _agent_last_seen.pop(agent_id, None)
 
@@ -1353,38 +1655,101 @@ async def agent_websocket(
         except Exception:
             pass
 
-        # Broadcast to dashboards
-        await broadcast_to_dashboards({
-            "type": "agent_disconnected",
-            "data": {
-                "agent_id": agent_id,
-                "timestamp": datetime.now(timezone.utc).isoformat(),
+        # Broadcast to dashboards (filtered by client - uses cached client_id)
+        await broadcast_to_dashboards(
+            {
+                "type": "agent_disconnected",
+                "data": {
+                    "agent_id": agent_id,
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                },
             },
-        })
+            agent_id=agent_id,
+        )
+
+        # Now clean up the client map after broadcast
+        _agent_client_map.pop(agent_id, None)
 
 
 @app.websocket("/ws/dashboard")
-async def dashboard_websocket(websocket: WebSocket) -> None:
+async def dashboard_websocket(
+    websocket: WebSocket,
+    token: str = Query(None),
+) -> None:
     """WebSocket endpoint for dashboard connections.
 
     Dashboards connect here to receive real-time updates about agents.
-    No authentication required (can be restricted via reverse proxy).
+    Authentication is required via JWT token passed as query parameter.
+    Agents are filtered by client_id for multi-tenant isolation.
     """
-    await websocket.accept()
-    _dashboard_subscribers.add(websocket)
+    import os
 
-    logger.info("dashboard_ws_connected", total=len(_dashboard_subscribers))
+    # Get JWT settings
+    jwt_secret = os.environ.get("ASEOKA_JWT_SECRET") or os.environ.get("ASEOKA_HUB_JWT_SECRET")
+
+    # Check if auth is required (can be disabled for development)
+    require_auth = os.environ.get("ASEOKA_HUB_REQUIRE_AUTH", "true").lower() == "true"
+
+    auth_info: AuthInfo | None = None
+    client_id: str | None = None
+    is_admin: bool = False
+
+    if require_auth:
+        if not jwt_secret:
+            await websocket.close(code=1008, reason="JWT not configured on server")
+            return
+
+        if not token:
+            await websocket.close(code=1008, reason="Authentication required - token missing")
+            return
+
+        token_manager = TokenManager(secret=jwt_secret)
+        auth_info = token_manager.verify_token(token)
+
+        if not auth_info:
+            await websocket.close(code=1008, reason="Invalid or expired token")
+            return
+
+        client_id = auth_info.client_id
+        is_admin = auth_info.is_admin
+
+        # Non-admin users must have a client_id
+        if not is_admin and not client_id:
+            await websocket.close(code=1008, reason="Token missing client_id claim")
+            return
+
+    # Accept connection and register with client info
+    await websocket.accept()
+    _dashboard_subscribers[websocket] = {
+        "client_id": client_id,
+        "is_admin": is_admin,
+    }
+
+    logger.info(
+        "dashboard_ws_connected",
+        total=len(_dashboard_subscribers),
+        client_id=client_id,
+        is_admin=is_admin,
+    )
 
     try:
-        # Send initial stats
+        # Send initial stats (filtered by client_id)
         db = get_db()
         all_agents = await db.get_all_agents()
-        online_agents = [a for a in all_agents if a.status == "online"]
+
+        # Filter agents by client_id (admins see all)
+        if is_admin:
+            visible_agents = all_agents
+        else:
+            visible_agents = [a for a in all_agents if a.client_id == client_id]
+
+        online_agents = [a for a in visible_agents if a.status == "online"]
 
         # Build agents array with health data for dashboard
         agents_data = [
             {
                 "agent_id": a.agent_id,
+                "client_id": a.client_id,
                 "site_url": a.site_url,
                 "site_name": a.site_name,
                 "status": a.status,
@@ -1392,16 +1757,23 @@ async def dashboard_websocket(websocket: WebSocket) -> None:
                 "active_issues": a.active_issues or 0,
                 "pending_fixes": a.pending_fixes or 0,
             }
-            for a in all_agents
+            for a in visible_agents
+        ]
+
+        # Filter connected_agent_ids to only those this client can see
+        visible_agent_ids = {a.agent_id for a in visible_agents}
+        visible_connected = [
+            aid for aid in get_connected_agent_ids() if aid in visible_agent_ids
         ]
 
         await websocket.send_text(json.dumps({
             "type": "initial_stats",
             "data": {
-                "total_agents": len(all_agents),
+                "total_agents": len(visible_agents),
                 "online_agents": len(online_agents),
-                "connected_agent_ids": get_connected_agent_ids(),
+                "connected_agent_ids": visible_connected,
                 "agents": agents_data,
+                "client_id": client_id,
                 "timestamp": datetime.now(timezone.utc).isoformat(),
             },
         }))
@@ -1428,6 +1800,20 @@ async def dashboard_websocket(websocket: WebSocket) -> None:
                     command_id = generate_id("cmd")
 
                     if agent_id and command:
+                        # Verify this dashboard can access this agent
+                        agent_client_id = _agent_client_map.get(agent_id)
+                        can_access = is_admin or (client_id and agent_client_id == client_id)
+
+                        if not can_access:
+                            await websocket.send_text(json.dumps({
+                                "type": "error",
+                                "data": {
+                                    "message": "Access denied: agent belongs to different client",
+                                    "agent_id": agent_id,
+                                },
+                            }))
+                            continue
+
                         success = await send_to_agent(agent_id, {
                             "type": "command",
                             "data": {
@@ -1450,11 +1836,11 @@ async def dashboard_websocket(websocket: WebSocket) -> None:
                 await websocket.send_text(json.dumps({"type": "ping"}))
 
     except WebSocketDisconnect:
-        logger.info("dashboard_ws_disconnected")
+        logger.info("dashboard_ws_disconnected", client_id=client_id)
     except Exception as e:
-        logger.error("dashboard_ws_error", error=str(e))
+        logger.error("dashboard_ws_error", error=str(e), client_id=client_id)
     finally:
-        _dashboard_subscribers.discard(websocket)
+        _dashboard_subscribers.pop(websocket, None)
 
 
 @app.get("/ws/stats")
@@ -1493,11 +1879,17 @@ def create_app(db_path: str = "hub.db") -> FastAPI:
         yield
         await _db.close()
 
+    # Docs disabled by default for security
+    docs_enabled = _os.environ.get("ASEOKA_HUB_DOCS_ENABLED", "false").lower() == "true"
+
     return FastAPI(
         title="ASEOKA Hub",
         description="Central coordination server for ASEOKA agents",
         version="4.0.0",
         lifespan=custom_lifespan,
+        docs_url="/docs" if docs_enabled else None,
+        redoc_url="/redoc" if docs_enabled else None,
+        openapi_url="/openapi.json" if docs_enabled else None,
     )
 
 

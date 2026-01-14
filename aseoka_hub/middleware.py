@@ -32,12 +32,11 @@ class AuthMiddleware(BaseHTTPMiddleware):
     """
 
     # Paths that don't require authentication
+    # NOTE: /docs, /openapi.json, /redoc intentionally removed for security
+    # API documentation should not be publicly accessible in production
     EXEMPT_PATHS: ClassVar[set[str]] = {
         "/",
         "/health",
-        "/docs",
-        "/openapi.json",
-        "/redoc",
         "/install.sh",
         "/bootstrap",
         "/auth/login",

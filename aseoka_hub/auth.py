@@ -19,6 +19,7 @@ class AuthInfo:
     """Authentication information extracted from request."""
 
     agent_id: str | None
+    client_id: str | None = None  # For dashboard/multi-tenant auth
     key_id: str | None = None
     cert_cn: str | None = None
     auth_method: str = "none"  # api_key, mtls, jwt, none
@@ -38,6 +39,21 @@ class AuthInfo:
             return True
         return permission in self.permissions
 
+    def can_access_agent(self, agent_client_id: str | None) -> bool:
+        """Check if this auth can access an agent belonging to a client.
+
+        Args:
+            agent_client_id: The client_id of the agent
+
+        Returns:
+            True if access is allowed
+        """
+        if self.is_admin:
+            return True
+        if not self.client_id or not agent_client_id:
+            return False
+        return self.client_id == agent_client_id
+
 
 class TokenManager:
     """JWT token management for WebSocket and API authentication."""
@@ -54,14 +70,16 @@ class TokenManager:
 
     def create_token(
         self,
-        agent_id: str,
+        agent_id: str | None = None,
+        client_id: str | None = None,
         permissions: list[str] | None = None,
         extra_claims: dict | None = None,
     ) -> str:
-        """Create a JWT token for an agent.
+        """Create a JWT token for an agent or dashboard user.
 
         Args:
-            agent_id: Agent ID (becomes 'sub' claim)
+            agent_id: Agent ID (becomes 'sub' claim for agents)
+            client_id: Client ID (for dashboard/multi-tenant auth)
             permissions: List of permissions
             extra_claims: Additional claims to include
 
@@ -70,16 +88,41 @@ class TokenManager:
         """
         now = datetime.now(timezone.utc)
         payload = {
-            "sub": agent_id,
             "iat": now,
             "exp": now + timedelta(minutes=self.expiry_minutes),
             "permissions": permissions or ["agent"],
         }
 
+        # Set subject based on what's provided
+        if agent_id:
+            payload["sub"] = agent_id
+        if client_id:
+            payload["client_id"] = client_id
+
         if extra_claims:
             payload.update(extra_claims)
 
         return jwt.encode(payload, self.secret, algorithm="HS256")
+
+    def create_dashboard_token(
+        self,
+        client_id: str,
+        permissions: list[str] | None = None,
+    ) -> str:
+        """Create a JWT token for dashboard access.
+
+        Args:
+            client_id: Client ID for multi-tenant filtering
+            permissions: List of permissions (defaults to ["dashboard"])
+
+        Returns:
+            Encoded JWT token
+        """
+        return self.create_token(
+            client_id=client_id,
+            permissions=permissions or ["dashboard"],
+            extra_claims={"type": "dashboard"},
+        )
 
     def verify_token(self, token: str) -> AuthInfo | None:
         """Verify a JWT token and return auth info.
@@ -96,6 +139,7 @@ class TokenManager:
 
             return AuthInfo(
                 agent_id=payload.get("sub"),
+                client_id=payload.get("client_id"),
                 auth_method="jwt",
                 permissions=permissions,
                 is_admin="admin" in permissions,
