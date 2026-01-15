@@ -310,6 +310,117 @@ class HubDatabase:
             created_at=datetime.fromisoformat(row["created_at"]) if row["created_at"] else None,
         )
 
+    async def get_all_clients(self) -> list[Client]:
+        """Get all clients.
+
+        Returns:
+            List of all clients
+        """
+        if not self._connection:
+            raise RuntimeError("Database not connected")
+
+        cursor = await self._connection.execute(
+            "SELECT * FROM clients ORDER BY created_at DESC"
+        )
+        rows = await cursor.fetchall()
+
+        return [
+            Client(
+                client_id=row["client_id"],
+                client_name=row["client_name"],
+                tier=row["tier"],
+                contact_email=row["contact_email"],
+                max_agents=row["max_agents"],
+                max_pages_per_scan=row["max_pages_per_scan"],
+                max_fixes_per_month=row["max_fixes_per_month"],
+                current_month_fixes=row["current_month_fixes"],
+                created_at=datetime.fromisoformat(row["created_at"]) if row["created_at"] else None,
+            )
+            for row in rows
+        ]
+
+    async def get_client_agent_counts(self) -> dict[str, dict[str, int]]:
+        """Get agent counts per client.
+
+        Returns:
+            Dict mapping client_id to {total, online, offline} counts
+        """
+        if not self._connection:
+            raise RuntimeError("Database not connected")
+
+        cursor = await self._connection.execute(
+            """SELECT client_id,
+                      COUNT(*) as total,
+                      SUM(CASE WHEN status = 'online' THEN 1 ELSE 0 END) as online,
+                      SUM(CASE WHEN status = 'offline' THEN 1 ELSE 0 END) as offline
+               FROM agents
+               GROUP BY client_id"""
+        )
+        rows = await cursor.fetchall()
+
+        return {
+            row["client_id"]: {
+                "total": row["total"],
+                "online": row["online"] or 0,
+                "offline": row["offline"] or 0,
+            }
+            for row in rows
+        }
+
+    async def get_fleet_health_summary(self) -> dict[str, any]:
+        """Get fleet-wide health summary for admin dashboard.
+
+        Returns:
+            Dict with fleet health metrics
+        """
+        if not self._connection:
+            raise RuntimeError("Database not connected")
+
+        # Get overall agent stats
+        cursor = await self._connection.execute(
+            """SELECT
+                COUNT(*) as total_agents,
+                SUM(CASE WHEN status = 'online' THEN 1 ELSE 0 END) as online_agents,
+                SUM(CASE WHEN status = 'offline' THEN 1 ELSE 0 END) as offline_agents,
+                SUM(CASE WHEN status = 'error' THEN 1 ELSE 0 END) as error_agents,
+                AVG(health_score) as avg_health_score,
+                SUM(active_issues) as total_active_issues,
+                SUM(pending_fixes) as total_pending_fixes
+               FROM agents"""
+        )
+        row = await cursor.fetchone()
+
+        # Get client count
+        client_cursor = await self._connection.execute("SELECT COUNT(*) as count FROM clients")
+        client_row = await client_cursor.fetchone()
+
+        # Get agents with low health (< 50)
+        unhealthy_cursor = await self._connection.execute(
+            "SELECT COUNT(*) as count FROM agents WHERE health_score < 50 AND status = 'online'"
+        )
+        unhealthy_row = await unhealthy_cursor.fetchone()
+
+        # Get agents with stale heartbeat (> 5 minutes)
+        stale_cursor = await self._connection.execute(
+            """SELECT COUNT(*) as count FROM agents
+               WHERE status = 'online'
+               AND datetime(last_heartbeat) < datetime('now', '-5 minutes')"""
+        )
+        stale_row = await stale_cursor.fetchone()
+
+        return {
+            "total_clients": client_row["count"],
+            "total_agents": row["total_agents"] or 0,
+            "online_agents": row["online_agents"] or 0,
+            "offline_agents": row["offline_agents"] or 0,
+            "error_agents": row["error_agents"] or 0,
+            "avg_health_score": round(row["avg_health_score"] or 0, 1),
+            "total_active_issues": row["total_active_issues"] or 0,
+            "total_pending_fixes": row["total_pending_fixes"] or 0,
+            "unhealthy_agents": unhealthy_row["count"] or 0,
+            "stale_heartbeat_agents": stale_row["count"] or 0,
+        }
+
     # Agent operations
 
     async def register_agent(self, agent: Agent) -> None:

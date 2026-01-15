@@ -1426,6 +1426,219 @@ async def bootstrap_agent(request: BootstrapRequest) -> BootstrapResponse:
     )
 
 
+# Admin response models
+
+
+class AdminClientResponse(BaseModel):
+    """Admin client details with agent counts."""
+
+    client_id: str
+    client_name: str
+    tier: str
+    contact_email: str | None
+    max_agents: int
+    max_pages_per_scan: int
+    max_fixes_per_month: int
+    current_month_fixes: int
+    created_at: str | None
+    # Agent counts
+    total_agents: int = 0
+    online_agents: int = 0
+    offline_agents: int = 0
+
+
+class AdminAgentResponse(BaseModel):
+    """Admin agent details with full info."""
+
+    agent_id: str
+    client_id: str
+    client_name: str | None = None
+    site_url: str
+    site_name: str
+    platform: str | None
+    tier: str
+    status: str
+    health_score: int
+    active_issues: int = 0
+    pending_fixes: int = 0
+    last_heartbeat: str | None
+    registered_at: str | None
+    has_repo_access: bool
+    has_github_access: bool
+    llm_provider: str
+    callback_url: str | None = None
+
+
+class FleetHealthSummary(BaseModel):
+    """Fleet-wide health summary."""
+
+    total_clients: int
+    total_agents: int
+    online_agents: int
+    offline_agents: int
+    error_agents: int
+    avg_health_score: float
+    total_active_issues: int
+    total_pending_fixes: int
+    unhealthy_agents: int
+    stale_heartbeat_agents: int
+    timestamp: str
+
+
+# Admin endpoints
+
+
+@app.get("/admin/clients", response_model=list[AdminClientResponse])
+async def admin_list_clients(
+    request: Request,
+    tier: str | None = None,
+) -> list[AdminClientResponse]:
+    """List all clients with agent counts (admin only).
+
+    Returns all clients with their agent statistics for admin dashboard.
+    """
+    db = get_db()
+
+    # Get all clients
+    clients = await db.get_all_clients()
+
+    # Get agent counts per client
+    agent_counts = await db.get_client_agent_counts()
+
+    # Filter by tier if specified
+    if tier:
+        clients = [c for c in clients if c.tier == tier]
+
+    return [
+        AdminClientResponse(
+            client_id=c.client_id,
+            client_name=c.client_name,
+            tier=c.tier,
+            contact_email=c.contact_email,
+            max_agents=c.max_agents,
+            max_pages_per_scan=c.max_pages_per_scan,
+            max_fixes_per_month=c.max_fixes_per_month,
+            current_month_fixes=c.current_month_fixes,
+            created_at=c.created_at.isoformat() if c.created_at else None,
+            total_agents=agent_counts.get(c.client_id, {}).get("total", 0),
+            online_agents=agent_counts.get(c.client_id, {}).get("online", 0),
+            offline_agents=agent_counts.get(c.client_id, {}).get("offline", 0),
+        )
+        for c in clients
+    ]
+
+
+@app.get("/admin/agents", response_model=list[AdminAgentResponse])
+async def admin_list_agents(
+    request: Request,
+    client_id: str | None = None,
+    status_filter: str | None = Query(None, alias="status"),
+    health_below: int | None = None,
+) -> list[AdminAgentResponse]:
+    """List all agents with full details (admin only).
+
+    Returns all agents across all clients for admin dashboard.
+    Supports filtering by client_id, status, and health threshold.
+    """
+    db = get_db()
+
+    # Get all agents
+    if client_id:
+        agents = await db.get_agents_by_client(client_id)
+    else:
+        agents = await db.get_all_agents()
+
+    # Apply filters
+    if status_filter:
+        agents = [a for a in agents if a.status == status_filter]
+
+    if health_below is not None:
+        agents = [a for a in agents if a.health_score < health_below]
+
+    # Get client names for display
+    clients = await db.get_all_clients()
+    client_names = {c.client_id: c.client_name for c in clients}
+
+    return [
+        AdminAgentResponse(
+            agent_id=a.agent_id,
+            client_id=a.client_id,
+            client_name=client_names.get(a.client_id),
+            site_url=a.site_url,
+            site_name=a.site_name,
+            platform=a.platform,
+            tier=a.tier,
+            status=a.status,
+            health_score=a.health_score,
+            active_issues=a.active_issues,
+            pending_fixes=a.pending_fixes,
+            last_heartbeat=a.last_heartbeat.isoformat() if a.last_heartbeat else None,
+            registered_at=a.registered_at.isoformat() if a.registered_at else None,
+            has_repo_access=a.has_repo_access,
+            has_github_access=a.has_github_access,
+            llm_provider=a.llm_provider,
+            callback_url=a.callback_url,
+        )
+        for a in agents
+    ]
+
+
+@app.get("/admin/agents/health/summary", response_model=FleetHealthSummary)
+async def admin_fleet_health_summary(request: Request) -> FleetHealthSummary:
+    """Get fleet-wide health summary (admin only).
+
+    Returns aggregate metrics for the entire agent fleet.
+    """
+    db = get_db()
+    summary = await db.get_fleet_health_summary()
+
+    return FleetHealthSummary(
+        total_clients=summary["total_clients"],
+        total_agents=summary["total_agents"],
+        online_agents=summary["online_agents"],
+        offline_agents=summary["offline_agents"],
+        error_agents=summary["error_agents"],
+        avg_health_score=summary["avg_health_score"],
+        total_active_issues=summary["total_active_issues"],
+        total_pending_fixes=summary["total_pending_fixes"],
+        unhealthy_agents=summary["unhealthy_agents"],
+        stale_heartbeat_agents=summary["stale_heartbeat_agents"],
+        timestamp=datetime.now(timezone.utc).isoformat(),
+    )
+
+
+@app.get("/admin/activities", response_model=list[dict[str, Any]])
+async def admin_list_activities(
+    request: Request,
+    agent_id: str | None = None,
+    activity_type: str | None = None,
+    limit: int = 100,
+) -> list[dict[str, Any]]:
+    """List all activities across all agents (admin only).
+
+    Returns activity log for admin dashboard with optional filters.
+    """
+    db = get_db()
+
+    activities = await db.get_activities(
+        agent_id=agent_id,
+        activity_type=activity_type,
+        limit=min(limit, 1000),
+    )
+
+    return [
+        {
+            "activity_id": a.activity_id,
+            "agent_id": a.agent_id,
+            "activity_type": a.activity_type,
+            "description": a.description,
+            "metadata": a.metadata,
+            "created_at": a.created_at.isoformat() if a.created_at else None,
+        }
+        for a in activities
+    ]
+
+
 @app.post("/admin/provisioning-tokens", response_model=ProvisioningTokenResponse, status_code=status.HTTP_201_CREATED)
 async def create_provisioning_token(request: CreateProvisioningTokenRequest) -> ProvisioningTokenResponse:
     """Create a new provisioning token (admin only).
