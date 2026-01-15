@@ -2,10 +2,12 @@
 
 import asyncio
 import json
+import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
+import httpx
 from fastapi import FastAPI, HTTPException, Query, Request, WebSocket, WebSocketDisconnect, status
 from pydantic import BaseModel, Field
 
@@ -274,6 +276,68 @@ class ProvisioningTokenResponse(BaseModel):
     tier: str
     max_agents: int
     expires_at: str
+
+
+# Command/Diagnostics models for agent remote control
+
+class AgentCommandRequest(BaseModel):
+    """Request to execute a command on an agent."""
+
+    command: str  # pause, resume, flush_logs, collect_diagnostics, ping
+    params: dict[str, Any] = Field(default_factory=dict)
+
+
+class AgentCommandResponse(BaseModel):
+    """Response from agent command execution."""
+
+    request_id: str
+    command: str
+    status: str  # success, error
+    data: dict[str, Any] = Field(default_factory=dict)
+    error: str | None = None
+    timestamp: str
+
+
+class SystemMetricsResponse(BaseModel):
+    """System resource metrics from agent."""
+
+    cpu_percent: float
+    memory_percent: float
+    memory_used_mb: float
+    memory_available_mb: float
+    disk_percent: float
+    disk_used_gb: float
+    disk_free_gb: float
+    open_files: int
+    threads: int
+    timestamp: str
+
+
+class AgentDiagnosticsResponse(BaseModel):
+    """Full diagnostic snapshot from agent."""
+
+    agent_id: str
+    agent_version: str
+    uptime_seconds: float
+    python_version: str
+    platform: str
+    platform_version: str
+    hostname: str
+    config: dict[str, Any]
+    current_phase: str
+    is_paused: bool
+    health_score: int
+    system_metrics: SystemMetricsResponse
+    issues_count: int
+    fixes_count: int
+    scans_count: int
+    total_tokens_used: int
+    token_usage_by_purpose: dict[str, int]
+    last_scan_id: str | None = None
+    last_scan_time: str | None = None
+    last_heartbeat: str | None = None
+    log_forwarder_stats: dict[str, int] | None = None
+    timestamp: str
 
 
 # WebSocket helper functions
@@ -1788,6 +1852,199 @@ async def admin_get_agent_log_stats(agent_id: str) -> LogStatsResponse:
         CRITICAL=stats.get("CRITICAL", 0),
         total=total,
     )
+
+
+# Agent remote control endpoints
+
+
+async def _get_agent_callback_url(agent_id: str) -> str:
+    """Get agent callback URL from database.
+
+    Args:
+        agent_id: Agent ID
+
+    Returns:
+        Callback URL
+
+    Raises:
+        HTTPException: If agent not found or no callback URL
+    """
+    db = get_db()
+    agent = await db.get_agent(agent_id)
+    if not agent:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Agent {agent_id} not found",
+        )
+    if not agent.callback_url:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Agent {agent_id} has no callback URL configured",
+        )
+    return agent.callback_url
+
+
+@app.post("/admin/agents/{agent_id}/command", response_model=AgentCommandResponse)
+async def admin_send_agent_command(
+    agent_id: str,
+    request: AgentCommandRequest,
+) -> AgentCommandResponse:
+    """Send a command to an agent (admin only).
+
+    Proxies the command to the agent via its callback URL.
+
+    Available commands:
+    - ping: Simple health check
+    - pause: Pause scanning
+    - resume: Resume scanning
+    - flush_logs: Force log upload to hub
+    - collect_diagnostics: Collect full diagnostics
+    """
+    callback_url = await _get_agent_callback_url(agent_id)
+    request_id = str(uuid.uuid4())
+
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            response = await client.post(
+                f"{callback_url}/command",
+                json={
+                    "command": request.command,
+                    "request_id": request_id,
+                    "params": request.params,
+                },
+            )
+
+            if response.status_code != 200:
+                raise HTTPException(
+                    status_code=response.status_code,
+                    detail=f"Agent returned error: {response.text}",
+                )
+
+            data = response.json()
+            return AgentCommandResponse(
+                request_id=data.get("request_id", request_id),
+                command=data.get("command", request.command),
+                status=data.get("status", "unknown"),
+                data=data.get("data", {}),
+                error=data.get("error"),
+                timestamp=data.get("timestamp", datetime.now(timezone.utc).isoformat()),
+            )
+
+    except httpx.RequestError as e:
+        logger.error("agent_command_failed", agent_id=agent_id, error=str(e))
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=f"Failed to reach agent: {str(e)}",
+        )
+
+
+@app.get("/admin/agents/{agent_id}/diagnostics", response_model=AgentDiagnosticsResponse)
+async def admin_get_agent_diagnostics(agent_id: str) -> AgentDiagnosticsResponse:
+    """Get full diagnostics from an agent (admin only).
+
+    Proxies the request to the agent via its callback URL.
+    """
+    callback_url = await _get_agent_callback_url(agent_id)
+
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            response = await client.get(f"{callback_url}/diagnostics")
+
+            if response.status_code != 200:
+                raise HTTPException(
+                    status_code=response.status_code,
+                    detail=f"Agent returned error: {response.text}",
+                )
+
+            data = response.json()
+
+            # Convert nested system_metrics dict to response model
+            metrics_data = data.get("system_metrics", {})
+            system_metrics = SystemMetricsResponse(
+                cpu_percent=metrics_data.get("cpu_percent", 0),
+                memory_percent=metrics_data.get("memory_percent", 0),
+                memory_used_mb=metrics_data.get("memory_used_mb", 0),
+                memory_available_mb=metrics_data.get("memory_available_mb", 0),
+                disk_percent=metrics_data.get("disk_percent", 0),
+                disk_used_gb=metrics_data.get("disk_used_gb", 0),
+                disk_free_gb=metrics_data.get("disk_free_gb", 0),
+                open_files=metrics_data.get("open_files", 0),
+                threads=metrics_data.get("threads", 0),
+                timestamp=metrics_data.get("timestamp", datetime.now(timezone.utc).isoformat()),
+            )
+
+            return AgentDiagnosticsResponse(
+                agent_id=data.get("agent_id", agent_id),
+                agent_version=data.get("agent_version", "unknown"),
+                uptime_seconds=data.get("uptime_seconds", 0),
+                python_version=data.get("python_version", "unknown"),
+                platform=data.get("platform", "unknown"),
+                platform_version=data.get("platform_version", "unknown"),
+                hostname=data.get("hostname", "unknown"),
+                config=data.get("config", {}),
+                current_phase=data.get("current_phase", "unknown"),
+                is_paused=data.get("is_paused", False),
+                health_score=data.get("health_score", 0),
+                system_metrics=system_metrics,
+                issues_count=data.get("issues_count", 0),
+                fixes_count=data.get("fixes_count", 0),
+                scans_count=data.get("scans_count", 0),
+                total_tokens_used=data.get("total_tokens_used", 0),
+                token_usage_by_purpose=data.get("token_usage_by_purpose", {}),
+                last_scan_id=data.get("last_scan_id"),
+                last_scan_time=data.get("last_scan_time"),
+                last_heartbeat=data.get("last_heartbeat"),
+                log_forwarder_stats=data.get("log_forwarder_stats"),
+                timestamp=data.get("timestamp", datetime.now(timezone.utc).isoformat()),
+            )
+
+    except httpx.RequestError as e:
+        logger.error("agent_diagnostics_failed", agent_id=agent_id, error=str(e))
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=f"Failed to reach agent: {str(e)}",
+        )
+
+
+@app.get("/admin/agents/{agent_id}/metrics")
+async def admin_get_agent_metrics(agent_id: str) -> SystemMetricsResponse:
+    """Get current system metrics from an agent (admin only).
+
+    Proxies the request to the agent via its callback URL.
+    """
+    callback_url = await _get_agent_callback_url(agent_id)
+
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            response = await client.get(f"{callback_url}/metrics")
+
+            if response.status_code != 200:
+                raise HTTPException(
+                    status_code=response.status_code,
+                    detail=f"Agent returned error: {response.text}",
+                )
+
+            data = response.json()
+
+            return SystemMetricsResponse(
+                cpu_percent=data.get("cpu_percent", 0),
+                memory_percent=data.get("memory_percent", 0),
+                memory_used_mb=data.get("memory_used_mb", 0),
+                memory_available_mb=data.get("memory_available_mb", 0),
+                disk_percent=data.get("disk_percent", 0),
+                disk_used_gb=data.get("disk_used_gb", 0),
+                disk_free_gb=data.get("disk_free_gb", 0),
+                open_files=data.get("open_files", 0),
+                threads=data.get("threads", 0),
+                timestamp=data.get("timestamp", datetime.now(timezone.utc).isoformat()),
+            )
+
+    except httpx.RequestError as e:
+        logger.error("agent_metrics_failed", agent_id=agent_id, error=str(e))
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=f"Failed to reach agent: {str(e)}",
+        )
 
 
 @app.post("/admin/provisioning-tokens", response_model=ProvisioningTokenResponse, status_code=status.HTTP_201_CREATED)
