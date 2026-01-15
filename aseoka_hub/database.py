@@ -110,6 +110,20 @@ class ProvisioningToken:
     created_by: str = "system"
 
 
+@dataclass
+class LogEntry:
+    """Log entry from an agent."""
+
+    log_id: str
+    agent_id: str
+    level: str  # DEBUG, INFO, WARNING, ERROR, CRITICAL
+    logger_name: str
+    message: str
+    context: dict | None = None  # Additional structured data
+    timestamp: datetime | None = None
+    received_at: datetime | None = None
+
+
 # Hub schema SQL
 HUB_SCHEMA = """
 -- Clients (organizations using ASEOKA)
@@ -197,6 +211,18 @@ CREATE TABLE IF NOT EXISTS provisioning_tokens (
     created_by TEXT
 );
 
+-- Agent logs (streamed from agents for centralized monitoring)
+CREATE TABLE IF NOT EXISTS agent_logs (
+    log_id TEXT PRIMARY KEY,
+    agent_id TEXT NOT NULL REFERENCES agents(agent_id),
+    level TEXT NOT NULL,
+    logger_name TEXT NOT NULL,
+    message TEXT NOT NULL,
+    context TEXT,
+    timestamp TEXT NOT NULL,
+    received_at TEXT NOT NULL
+);
+
 -- Create indexes
 CREATE INDEX IF NOT EXISTS idx_agents_client ON agents(client_id);
 CREATE INDEX IF NOT EXISTS idx_agents_status ON agents(status);
@@ -206,6 +232,9 @@ CREATE INDEX IF NOT EXISTS idx_api_keys_agent ON api_keys(agent_id);
 CREATE INDEX IF NOT EXISTS idx_certs_agent ON certificates(agent_id);
 CREATE INDEX IF NOT EXISTS idx_certs_cn ON certificates(certificate_cn);
 CREATE INDEX IF NOT EXISTS idx_prov_tokens_client ON provisioning_tokens(client_id);
+CREATE INDEX IF NOT EXISTS idx_logs_agent ON agent_logs(agent_id);
+CREATE INDEX IF NOT EXISTS idx_logs_level ON agent_logs(level);
+CREATE INDEX IF NOT EXISTS idx_logs_timestamp ON agent_logs(timestamp);
 """
 
 
@@ -1147,3 +1176,189 @@ class HubDatabase:
         await self._connection.commit()
 
         return cursor.rowcount > 0
+
+    # Log operations
+
+    async def ingest_logs(self, entries: list[LogEntry]) -> int:
+        """Ingest a batch of log entries from an agent.
+
+        Args:
+            entries: List of log entries to store
+
+        Returns:
+            Number of entries successfully stored
+        """
+        if not self._connection:
+            raise RuntimeError("Database not connected")
+
+        if not entries:
+            return 0
+
+        now = datetime.now(timezone.utc).isoformat()
+        count = 0
+
+        for entry in entries:
+            try:
+                context_json = json.dumps(entry.context) if entry.context else None
+                timestamp = entry.timestamp.isoformat() if entry.timestamp else now
+
+                await self._connection.execute(
+                    """INSERT OR IGNORE INTO agent_logs
+                       (log_id, agent_id, level, logger_name, message, context, timestamp, received_at)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (
+                        entry.log_id,
+                        entry.agent_id,
+                        entry.level,
+                        entry.logger_name,
+                        entry.message,
+                        context_json,
+                        timestamp,
+                        now,
+                    ),
+                )
+                count += 1
+            except Exception as e:
+                logger.warning("log_ingest_failed", log_id=entry.log_id, error=str(e))
+
+        await self._connection.commit()
+        logger.debug("logs_ingested", count=count, agent_id=entries[0].agent_id if entries else None)
+
+        return count
+
+    async def query_logs(
+        self,
+        agent_id: str | None = None,
+        level: str | None = None,
+        logger_name: str | None = None,
+        search: str | None = None,
+        since: datetime | None = None,
+        until: datetime | None = None,
+        limit: int = 100,
+        offset: int = 0,
+    ) -> list[LogEntry]:
+        """Query logs with optional filters.
+
+        Args:
+            agent_id: Filter by agent ID
+            level: Filter by log level (DEBUG, INFO, WARNING, ERROR, CRITICAL)
+            logger_name: Filter by logger name
+            search: Search in message text
+            since: Only logs after this timestamp
+            until: Only logs before this timestamp
+            limit: Maximum number of entries to return
+            offset: Number of entries to skip
+
+        Returns:
+            List of matching log entries
+        """
+        if not self._connection:
+            raise RuntimeError("Database not connected")
+
+        query = "SELECT * FROM agent_logs WHERE 1=1"
+        params: list = []
+
+        if agent_id:
+            query += " AND agent_id = ?"
+            params.append(agent_id)
+
+        if level:
+            query += " AND level = ?"
+            params.append(level.upper())
+
+        if logger_name:
+            query += " AND logger_name LIKE ?"
+            params.append(f"%{logger_name}%")
+
+        if search:
+            query += " AND message LIKE ?"
+            params.append(f"%{search}%")
+
+        if since:
+            query += " AND timestamp >= ?"
+            params.append(since.isoformat())
+
+        if until:
+            query += " AND timestamp <= ?"
+            params.append(until.isoformat())
+
+        query += " ORDER BY timestamp DESC LIMIT ? OFFSET ?"
+        params.extend([limit, offset])
+
+        cursor = await self._connection.execute(query, params)
+        rows = await cursor.fetchall()
+
+        return [self._row_to_log_entry(row) for row in rows]
+
+    async def get_log_stats(self, agent_id: str) -> dict[str, int]:
+        """Get log statistics for an agent.
+
+        Args:
+            agent_id: Agent ID
+
+        Returns:
+            Dict with counts per log level
+        """
+        if not self._connection:
+            raise RuntimeError("Database not connected")
+
+        cursor = await self._connection.execute(
+            """SELECT level, COUNT(*) as count
+               FROM agent_logs
+               WHERE agent_id = ?
+               GROUP BY level""",
+            (agent_id,),
+        )
+        rows = await cursor.fetchall()
+
+        stats = {"DEBUG": 0, "INFO": 0, "WARNING": 0, "ERROR": 0, "CRITICAL": 0}
+        for row in rows:
+            stats[row["level"]] = row["count"]
+
+        return stats
+
+    async def delete_old_logs(self, older_than: datetime) -> int:
+        """Delete logs older than specified timestamp.
+
+        Args:
+            older_than: Delete logs before this timestamp
+
+        Returns:
+            Number of logs deleted
+        """
+        if not self._connection:
+            raise RuntimeError("Database not connected")
+
+        cursor = await self._connection.execute(
+            "DELETE FROM agent_logs WHERE timestamp < ?",
+            (older_than.isoformat(),),
+        )
+        await self._connection.commit()
+
+        deleted = cursor.rowcount
+        if deleted > 0:
+            logger.info("old_logs_deleted", count=deleted)
+
+        return deleted
+
+    def _row_to_log_entry(self, row: aiosqlite.Row) -> LogEntry:
+        """Convert database row to LogEntry.
+
+        Args:
+            row: Database row
+
+        Returns:
+            LogEntry object
+        """
+        context = json.loads(row["context"]) if row["context"] else None
+
+        return LogEntry(
+            log_id=row["log_id"],
+            agent_id=row["agent_id"],
+            level=row["level"],
+            logger_name=row["logger_name"],
+            message=row["message"],
+            context=context,
+            timestamp=datetime.fromisoformat(row["timestamp"]) if row["timestamp"] else None,
+            received_at=datetime.fromisoformat(row["received_at"]) if row["received_at"] else None,
+        )

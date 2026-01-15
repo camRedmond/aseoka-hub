@@ -1639,6 +1639,157 @@ async def admin_list_activities(
     ]
 
 
+# Log ingestion and query endpoints
+
+
+class LogEntryRequest(BaseModel):
+    """Log entry from agent."""
+
+    log_id: str
+    level: str
+    logger_name: str
+    message: str
+    context: dict[str, Any] | None = None
+    timestamp: str | None = None
+
+
+class LogIngestRequest(BaseModel):
+    """Request to ingest log entries."""
+
+    agent_id: str
+    entries: list[LogEntryRequest]
+
+
+class LogIngestResponse(BaseModel):
+    """Response from log ingestion."""
+
+    ingested: int
+    agent_id: str
+
+
+class LogEntryResponse(BaseModel):
+    """Log entry in response."""
+
+    log_id: str
+    agent_id: str
+    level: str
+    logger_name: str
+    message: str
+    context: dict[str, Any] | None = None
+    timestamp: str | None
+    received_at: str | None
+
+
+class LogStatsResponse(BaseModel):
+    """Log statistics for an agent."""
+
+    agent_id: str
+    DEBUG: int = 0
+    INFO: int = 0
+    WARNING: int = 0
+    ERROR: int = 0
+    CRITICAL: int = 0
+    total: int = 0
+
+
+@app.post("/logs/ingest", response_model=LogIngestResponse)
+async def ingest_logs(request: LogIngestRequest) -> LogIngestResponse:
+    """Ingest log entries from an agent.
+
+    Agents call this endpoint to stream their logs to the Hub for centralized monitoring.
+    """
+    from aseoka_hub.database import LogEntry
+
+    db = get_db()
+
+    # Convert request entries to LogEntry objects
+    entries = [
+        LogEntry(
+            log_id=e.log_id,
+            agent_id=request.agent_id,
+            level=e.level.upper(),
+            logger_name=e.logger_name,
+            message=e.message,
+            context=e.context,
+            timestamp=datetime.fromisoformat(e.timestamp) if e.timestamp else None,
+        )
+        for e in request.entries
+    ]
+
+    count = await db.ingest_logs(entries)
+
+    return LogIngestResponse(ingested=count, agent_id=request.agent_id)
+
+
+@app.get("/admin/agents/{agent_id}/logs", response_model=list[LogEntryResponse])
+async def admin_get_agent_logs(
+    agent_id: str,
+    level: str | None = None,
+    logger_name: str | None = None,
+    search: str | None = None,
+    since: str | None = None,
+    until: str | None = None,
+    limit: int = 100,
+    offset: int = 0,
+) -> list[LogEntryResponse]:
+    """Get logs for a specific agent (admin only).
+
+    Supports filtering by level, logger name, search text, and time range.
+    """
+    db = get_db()
+
+    # Parse datetime parameters
+    since_dt = datetime.fromisoformat(since) if since else None
+    until_dt = datetime.fromisoformat(until) if until else None
+
+    logs = await db.query_logs(
+        agent_id=agent_id,
+        level=level,
+        logger_name=logger_name,
+        search=search,
+        since=since_dt,
+        until=until_dt,
+        limit=min(limit, 1000),
+        offset=offset,
+    )
+
+    return [
+        LogEntryResponse(
+            log_id=log.log_id,
+            agent_id=log.agent_id,
+            level=log.level,
+            logger_name=log.logger_name,
+            message=log.message,
+            context=log.context,
+            timestamp=log.timestamp.isoformat() if log.timestamp else None,
+            received_at=log.received_at.isoformat() if log.received_at else None,
+        )
+        for log in logs
+    ]
+
+
+@app.get("/admin/agents/{agent_id}/logs/stats", response_model=LogStatsResponse)
+async def admin_get_agent_log_stats(agent_id: str) -> LogStatsResponse:
+    """Get log statistics for an agent (admin only).
+
+    Returns counts of logs by level.
+    """
+    db = get_db()
+    stats = await db.get_log_stats(agent_id)
+
+    total = sum(stats.values())
+
+    return LogStatsResponse(
+        agent_id=agent_id,
+        DEBUG=stats.get("DEBUG", 0),
+        INFO=stats.get("INFO", 0),
+        WARNING=stats.get("WARNING", 0),
+        ERROR=stats.get("ERROR", 0),
+        CRITICAL=stats.get("CRITICAL", 0),
+        total=total,
+    )
+
+
 @app.post("/admin/provisioning-tokens", response_model=ProvisioningTokenResponse, status_code=status.HTTP_201_CREATED)
 async def create_provisioning_token(request: CreateProvisioningTokenRequest) -> ProvisioningTokenResponse:
     """Create a new provisioning token (admin only).
