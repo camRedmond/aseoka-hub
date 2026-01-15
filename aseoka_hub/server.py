@@ -5,16 +5,17 @@ import json
 import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
-from typing import Any
+from typing import Any, Literal
 
 import httpx
-from fastapi import FastAPI, HTTPException, Query, Request, WebSocket, WebSocketDisconnect, status
+from fastapi import FastAPI, HTTPException, Query, Request, Response, WebSocket, WebSocketDisconnect, status
 from pydantic import BaseModel, Field
 
 from aseoka_hub.logging import get_logger
 from aseoka_hub.types import generate_id
 from aseoka_hub.auth import AuthInfo, TokenManager
-from aseoka_hub.database import HubDatabase, Agent, Client, Activity
+from aseoka_hub.database import HubDatabase, Agent, Client, Activity, Alert
+from aseoka_hub.health_monitor import HealthMonitor
 from aseoka_hub.middleware import AuthMiddleware, get_auth_info
 from aseoka_hub.playbook import PlaybookManager, PlaybookEntry, PlaybookOutcome, CodeExample
 
@@ -310,6 +311,7 @@ class SystemMetricsResponse(BaseModel):
     disk_free_gb: float
     open_files: int
     threads: int
+    is_containerized: bool = False  # True if metrics are from Docker cgroups
     timestamp: str
 
 
@@ -338,6 +340,41 @@ class AgentDiagnosticsResponse(BaseModel):
     last_heartbeat: str | None = None
     log_forwarder_stats: dict[str, int] | None = None
     timestamp: str
+
+
+# Alert models
+
+class AlertResponse(BaseModel):
+    """Alert response."""
+
+    alert_id: str
+    agent_id: str
+    alert_type: str
+    severity: str
+    title: str
+    description: str
+    triggered_at: str
+    acknowledged_at: str | None = None
+    acknowledged_by: str | None = None
+    resolved_at: str | None = None
+    metadata: dict[str, Any] | None = None
+    # Include agent info for convenience
+    agent_name: str | None = None
+    agent_url: str | None = None
+
+
+class AlertCountsResponse(BaseModel):
+    """Alert counts by status."""
+
+    active: int
+    acknowledged: int
+    resolved_24h: int
+
+
+class AcknowledgeAlertRequest(BaseModel):
+    """Request to acknowledge an alert."""
+
+    acknowledged_by: str = "admin"
 
 
 # WebSocket helper functions
@@ -413,6 +450,7 @@ def get_connected_agent_ids() -> list[str]:
 # Global database instance
 _db: HubDatabase | None = None
 _playbook: PlaybookManager | None = None
+_health_monitor: HealthMonitor | None = None
 
 
 def get_db() -> HubDatabase:
@@ -490,14 +528,48 @@ async def lifespan(app: FastAPI):
             await _db.create_client(default_client)
             logger.info("default_client_created", client_id=default_client_id)
 
+    # Initialize health monitor
+    global _health_monitor
+
+    async def on_alert_created(alert: Alert):
+        """Broadcast new alerts to dashboards."""
+        await broadcast_to_dashboards({
+            "type": "alert",
+            "data": {
+                "alert_id": alert.alert_id,
+                "agent_id": alert.agent_id,
+                "alert_type": alert.alert_type,
+                "severity": alert.severity,
+                "title": alert.title,
+                "description": alert.description,
+                "triggered_at": alert.triggered_at.isoformat() if alert.triggered_at else None,
+            },
+        })
+
+    _health_monitor = HealthMonitor(
+        database=_db,
+        offline_threshold_minutes=10,
+        stale_threshold_minutes=5,
+        low_health_threshold=50,
+        critical_health_threshold=20,
+        check_interval_seconds=60,
+        on_alert_created=on_alert_created,
+    )
+    await _health_monitor.start()
+
     logger.info(
         "hub_server_started",
         playbook_initialized=True,
+        health_monitor_enabled=True,
         auth_required=_settings.hub_require_auth,
         api_key_enabled=_settings.hub_api_key_enabled,
         mtls_enabled=_settings.hub_mtls_enabled,
     )
     yield
+
+    # Shutdown
+    if _health_monitor:
+        await _health_monitor.stop()
     await _db.close()
     logger.info("hub_server_stopped")
 
@@ -1592,6 +1664,58 @@ async def admin_list_clients(
     ]
 
 
+class UpdateClientTierRequest(BaseModel):
+    """Request to update client tier."""
+
+    tier: Literal["starter", "pro", "enterprise"]
+    max_agents: int | None = None
+    max_pages_per_scan: int | None = None
+    max_fixes_per_month: int | None = None
+
+
+@app.put("/admin/clients/{client_id}/tier")
+async def admin_update_client_tier(
+    client_id: str,
+    request: UpdateClientTierRequest,
+) -> dict[str, Any]:
+    """Update a client's tier and associated limits (admin only)."""
+    db = get_db()
+
+    # Check client exists
+    client = await db.get_client(client_id)
+    if not client:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Client {client_id} not found",
+        )
+
+    success = await db.update_client_tier(
+        client_id=client_id,
+        tier=request.tier,
+        max_agents=request.max_agents,
+        max_pages_per_scan=request.max_pages_per_scan,
+        max_fixes_per_month=request.max_fixes_per_month,
+    )
+
+    if not success:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to update client tier",
+        )
+
+    # Get updated client data
+    updated_client = await db.get_client(client_id)
+
+    return {
+        "updated": True,
+        "client_id": client_id,
+        "tier": updated_client.tier if updated_client else request.tier,
+        "max_agents": updated_client.max_agents if updated_client else None,
+        "max_pages_per_scan": updated_client.max_pages_per_scan if updated_client else None,
+        "max_fixes_per_month": updated_client.max_fixes_per_month if updated_client else None,
+    }
+
+
 @app.get("/admin/agents", response_model=list[AdminAgentResponse])
 async def admin_list_agents(
     request: Request,
@@ -1701,6 +1825,98 @@ async def admin_list_activities(
         }
         for a in activities
     ]
+
+
+@app.get("/admin/activities/export")
+async def admin_export_activities(
+    format: str = Query("json", description="Export format: json or csv"),
+    agent_id: str | None = None,
+    activity_type: str | None = None,
+    limit: int = Query(1000, ge=1, le=10000, description="Maximum activities to export"),
+) -> Response:
+    """Export activities as JSON or CSV (admin only).
+
+    Returns activity log in downloadable format.
+    """
+    import csv
+    from io import StringIO
+
+    db = get_db()
+
+    activities = await db.get_activities(
+        agent_id=agent_id,
+        activity_type=activity_type,
+        limit=limit,
+    )
+
+    if format == "csv":
+        # Create CSV
+        output = StringIO()
+        writer = csv.writer(output)
+        writer.writerow(["activity_id", "agent_id", "activity_type", "description", "created_at", "metadata"])
+        for a in activities:
+            writer.writerow([
+                a.activity_id,
+                a.agent_id,
+                a.activity_type,
+                a.description or "",
+                a.created_at.isoformat() if a.created_at else "",
+                str(a.metadata) if a.metadata else "",
+            ])
+
+        content = output.getvalue()
+        return Response(
+            content=content,
+            media_type="text/csv",
+            headers={"Content-Disposition": "attachment; filename=activities.csv"},
+        )
+    else:
+        # Return JSON
+        import json as json_module
+
+        data = [
+            {
+                "activity_id": a.activity_id,
+                "agent_id": a.agent_id,
+                "activity_type": a.activity_type,
+                "description": a.description,
+                "metadata": a.metadata,
+                "created_at": a.created_at.isoformat() if a.created_at else None,
+            }
+            for a in activities
+        ]
+        content = json_module.dumps(data, indent=2)
+        return Response(
+            content=content,
+            media_type="application/json",
+            headers={"Content-Disposition": "attachment; filename=activities.json"},
+        )
+
+
+@app.get("/admin/playbook/stats")
+async def admin_playbook_stats(
+    days: int = Query(30, ge=1, le=365, description="Number of days to analyze"),
+) -> dict[str, Any]:
+    """Get playbook analytics and effectiveness metrics (admin only).
+
+    Returns activity statistics, fix rates, and agent performance data.
+    """
+    db = get_db()
+    stats = await db.get_activity_stats(days=days)
+
+    # Add fleet summary for context
+    fleet_summary = await db.get_fleet_health_summary()
+
+    return {
+        **stats,
+        "fleet_summary": {
+            "total_agents": fleet_summary["total_agents"],
+            "online_agents": fleet_summary["online_agents"],
+            "avg_health_score": fleet_summary["avg_health_score"],
+            "total_active_issues": fleet_summary["total_active_issues"],
+            "total_pending_fixes": fleet_summary["total_pending_fixes"],
+        },
+    }
 
 
 # Log ingestion and query endpoints
@@ -2036,6 +2252,7 @@ async def admin_get_agent_metrics(agent_id: str) -> SystemMetricsResponse:
                 disk_free_gb=data.get("disk_free_gb", 0),
                 open_files=data.get("open_files", 0),
                 threads=data.get("threads", 0),
+                is_containerized=data.get("is_containerized", False),
                 timestamp=data.get("timestamp", datetime.now(timezone.utc).isoformat()),
             )
 
@@ -2045,6 +2262,136 @@ async def admin_get_agent_metrics(agent_id: str) -> SystemMetricsResponse:
             status_code=status.HTTP_502_BAD_GATEWAY,
             detail=f"Failed to reach agent: {str(e)}",
         )
+
+
+# Alert endpoints
+
+
+@app.get("/admin/alerts", response_model=list[AlertResponse])
+async def admin_get_alerts(
+    agent_id: str | None = Query(None, description="Filter by agent ID"),
+    alert_type: str | None = Query(None, description="Filter by alert type"),
+    severity: str | None = Query(None, description="Filter by severity (warning, critical)"),
+    active_only: bool = Query(False, description="Only return unresolved alerts (deprecated)"),
+    status: str | None = Query(None, description="Filter by status: active, acknowledged, resolved"),
+    limit: int = Query(100, ge=1, le=500, description="Maximum alerts to return"),
+) -> list[AlertResponse]:
+    """Get alerts with optional filters (admin only)."""
+    db = get_db()
+    alerts = await db.get_alerts(
+        agent_id=agent_id,
+        alert_type=alert_type,
+        severity=severity,
+        active_only=active_only,
+        status=status,
+        limit=limit,
+    )
+
+    # Enrich with agent info
+    result = []
+    agents_cache: dict[str, Agent | None] = {}
+
+    for alert in alerts:
+        # Get agent info (cached)
+        if alert.agent_id not in agents_cache:
+            agents_cache[alert.agent_id] = await db.get_agent(alert.agent_id)
+
+        agent = agents_cache[alert.agent_id]
+
+        result.append(AlertResponse(
+            alert_id=alert.alert_id,
+            agent_id=alert.agent_id,
+            alert_type=alert.alert_type,
+            severity=alert.severity,
+            title=alert.title,
+            description=alert.description,
+            triggered_at=alert.triggered_at.isoformat() if alert.triggered_at else "",
+            acknowledged_at=alert.acknowledged_at.isoformat() if alert.acknowledged_at else None,
+            acknowledged_by=alert.acknowledged_by,
+            resolved_at=alert.resolved_at.isoformat() if alert.resolved_at else None,
+            metadata=alert.metadata,
+            agent_name=agent.site_name if agent else None,
+            agent_url=agent.site_url if agent else None,
+        ))
+
+    return result
+
+
+@app.get("/admin/alerts/counts", response_model=AlertCountsResponse)
+async def admin_get_alert_counts() -> AlertCountsResponse:
+    """Get alert counts by status (admin only)."""
+    db = get_db()
+    counts = await db.get_alert_counts()
+
+    return AlertCountsResponse(
+        active=counts["active"],
+        acknowledged=counts["acknowledged"],
+        resolved_24h=counts["resolved_24h"],
+    )
+
+
+@app.get("/admin/alerts/{alert_id}", response_model=AlertResponse)
+async def admin_get_alert(alert_id: str) -> AlertResponse:
+    """Get a specific alert (admin only)."""
+    db = get_db()
+    alert = await db.get_alert(alert_id)
+
+    if not alert:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Alert {alert_id} not found",
+        )
+
+    agent = await db.get_agent(alert.agent_id)
+
+    return AlertResponse(
+        alert_id=alert.alert_id,
+        agent_id=alert.agent_id,
+        alert_type=alert.alert_type,
+        severity=alert.severity,
+        title=alert.title,
+        description=alert.description,
+        triggered_at=alert.triggered_at.isoformat() if alert.triggered_at else "",
+        acknowledged_at=alert.acknowledged_at.isoformat() if alert.acknowledged_at else None,
+        acknowledged_by=alert.acknowledged_by,
+        resolved_at=alert.resolved_at.isoformat() if alert.resolved_at else None,
+        metadata=alert.metadata,
+        agent_name=agent.site_name if agent else None,
+        agent_url=agent.site_url if agent else None,
+    )
+
+
+@app.post("/admin/alerts/{alert_id}/acknowledge")
+async def admin_acknowledge_alert(
+    alert_id: str,
+    request: AcknowledgeAlertRequest,
+) -> dict[str, Any]:
+    """Acknowledge an alert (admin only)."""
+    db = get_db()
+
+    success = await db.acknowledge_alert(alert_id, request.acknowledged_by)
+    if not success:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Alert {alert_id} not found or already acknowledged",
+        )
+
+    return {"acknowledged": True, "alert_id": alert_id}
+
+
+@app.post("/admin/alerts/{alert_id}/resolve")
+async def admin_resolve_alert(alert_id: str) -> dict[str, Any]:
+    """Resolve an alert (admin only)."""
+    db = get_db()
+
+    success = await db.resolve_alert(alert_id)
+    if not success:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Alert {alert_id} not found or already resolved",
+        )
+
+    return {"resolved": True, "alert_id": alert_id}
 
 
 @app.post("/admin/provisioning-tokens", response_model=ProvisioningTokenResponse, status_code=status.HTTP_201_CREATED)

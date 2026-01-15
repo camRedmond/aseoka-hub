@@ -124,6 +124,23 @@ class LogEntry:
     received_at: datetime | None = None
 
 
+@dataclass
+class Alert:
+    """Health alert for fleet monitoring."""
+
+    alert_id: str
+    agent_id: str
+    alert_type: str  # offline, low_health, error, stale_heartbeat
+    severity: Literal["warning", "critical"] = "warning"
+    title: str = ""
+    description: str = ""
+    triggered_at: datetime | None = None
+    acknowledged_at: datetime | None = None
+    acknowledged_by: str | None = None
+    resolved_at: datetime | None = None
+    metadata: dict | None = None
+
+
 # Hub schema SQL
 HUB_SCHEMA = """
 -- Clients (organizations using ASEOKA)
@@ -223,6 +240,21 @@ CREATE TABLE IF NOT EXISTS agent_logs (
     received_at TEXT NOT NULL
 );
 
+-- Health alerts for fleet monitoring
+CREATE TABLE IF NOT EXISTS alerts (
+    alert_id TEXT PRIMARY KEY,
+    agent_id TEXT NOT NULL REFERENCES agents(agent_id),
+    alert_type TEXT NOT NULL,
+    severity TEXT DEFAULT 'warning',
+    title TEXT NOT NULL,
+    description TEXT,
+    triggered_at TEXT NOT NULL,
+    acknowledged_at TEXT,
+    acknowledged_by TEXT,
+    resolved_at TEXT,
+    metadata TEXT
+);
+
 -- Create indexes
 CREATE INDEX IF NOT EXISTS idx_agents_client ON agents(client_id);
 CREATE INDEX IF NOT EXISTS idx_agents_status ON agents(status);
@@ -235,6 +267,10 @@ CREATE INDEX IF NOT EXISTS idx_prov_tokens_client ON provisioning_tokens(client_
 CREATE INDEX IF NOT EXISTS idx_logs_agent ON agent_logs(agent_id);
 CREATE INDEX IF NOT EXISTS idx_logs_level ON agent_logs(level);
 CREATE INDEX IF NOT EXISTS idx_logs_timestamp ON agent_logs(timestamp);
+CREATE INDEX IF NOT EXISTS idx_alerts_agent ON alerts(agent_id);
+CREATE INDEX IF NOT EXISTS idx_alerts_type ON alerts(alert_type);
+CREATE INDEX IF NOT EXISTS idx_alerts_severity ON alerts(severity);
+CREATE INDEX IF NOT EXISTS idx_alerts_resolved ON alerts(resolved_at);
 """
 
 
@@ -367,6 +403,63 @@ class HubDatabase:
             )
             for row in rows
         ]
+
+    async def update_client_tier(
+        self,
+        client_id: str,
+        tier: str,
+        max_agents: int | None = None,
+        max_pages_per_scan: int | None = None,
+        max_fixes_per_month: int | None = None,
+    ) -> bool:
+        """Update a client's tier and associated limits.
+
+        Args:
+            client_id: Client ID to update
+            tier: New tier (starter, pro, enterprise)
+            max_agents: Override max agents (defaults based on tier)
+            max_pages_per_scan: Override max pages per scan (defaults based on tier)
+            max_fixes_per_month: Override max fixes per month (defaults based on tier)
+
+        Returns:
+            True if updated, False if client not found
+        """
+        if not self._connection:
+            raise RuntimeError("Database not connected")
+
+        # Tier-based defaults
+        tier_defaults = {
+            "starter": {"max_agents": 1, "max_pages_per_scan": 50, "max_fixes_per_month": 10},
+            "pro": {"max_agents": 5, "max_pages_per_scan": 200, "max_fixes_per_month": 50},
+            "enterprise": {"max_agents": 20, "max_pages_per_scan": 1000, "max_fixes_per_month": 200},
+        }
+
+        defaults = tier_defaults.get(tier, tier_defaults["starter"])
+
+        # Use provided values or tier defaults
+        actual_max_agents = max_agents if max_agents is not None else defaults["max_agents"]
+        actual_max_pages = max_pages_per_scan if max_pages_per_scan is not None else defaults["max_pages_per_scan"]
+        actual_max_fixes = max_fixes_per_month if max_fixes_per_month is not None else defaults["max_fixes_per_month"]
+
+        cursor = await self._connection.execute(
+            """UPDATE clients
+               SET tier = ?, max_agents = ?, max_pages_per_scan = ?, max_fixes_per_month = ?
+               WHERE client_id = ?""",
+            (tier, actual_max_agents, actual_max_pages, actual_max_fixes, client_id),
+        )
+        await self._connection.commit()
+
+        if cursor.rowcount > 0:
+            logger.info(
+                "client_tier_updated",
+                client_id=client_id,
+                tier=tier,
+                max_agents=actual_max_agents,
+                max_pages_per_scan=actual_max_pages,
+                max_fixes_per_month=actual_max_fixes,
+            )
+            return True
+        return False
 
     async def get_client_agent_counts(self) -> dict[str, dict[str, int]]:
         """Get agent counts per client.
@@ -744,6 +837,84 @@ class HubDatabase:
             )
 
         return activities
+
+    async def get_activity_stats(
+        self,
+        days: int = 30,
+    ) -> dict:
+        """Get activity statistics for playbook analytics.
+
+        Args:
+            days: Number of days to look back (default 30)
+
+        Returns:
+            Dict with activity type counts, daily trends, and top agents
+        """
+        if not self._connection:
+            raise RuntimeError("Database not connected")
+
+        since = datetime.now(timezone.utc) - timedelta(days=days)
+
+        # Get counts by activity type
+        cursor = await self._connection.execute(
+            """SELECT activity_type, COUNT(*) as count
+               FROM activities
+               WHERE created_at >= ?
+               GROUP BY activity_type
+               ORDER BY count DESC""",
+            (since.isoformat(),),
+        )
+        type_counts = {row["activity_type"]: row["count"] for row in await cursor.fetchall()}
+
+        # Get daily activity counts (last 7 days)
+        cursor = await self._connection.execute(
+            """SELECT DATE(created_at) as day, COUNT(*) as count
+               FROM activities
+               WHERE created_at >= ?
+               GROUP BY DATE(created_at)
+               ORDER BY day DESC
+               LIMIT 7""",
+            ((datetime.now(timezone.utc) - timedelta(days=7)).isoformat(),),
+        )
+        daily_counts = [{"day": row["day"], "count": row["count"]} for row in await cursor.fetchall()]
+
+        # Get top agents by activity
+        cursor = await self._connection.execute(
+            """SELECT a.agent_id, ag.site_name, COUNT(*) as activity_count
+               FROM activities a
+               LEFT JOIN agents ag ON a.agent_id = ag.agent_id
+               WHERE a.created_at >= ?
+               GROUP BY a.agent_id
+               ORDER BY activity_count DESC
+               LIMIT 5""",
+            (since.isoformat(),),
+        )
+        top_agents = [
+            {"agent_id": row["agent_id"], "site_name": row["site_name"], "activity_count": row["activity_count"]}
+            for row in await cursor.fetchall()
+        ]
+
+        # Calculate effectiveness metrics
+        issues_detected = type_counts.get("issue_detected", 0)
+        fixes_generated = type_counts.get("fix_generated", 0)
+        prs_created = type_counts.get("pr_created", 0)
+
+        fix_rate = (fixes_generated / issues_detected * 100) if issues_detected > 0 else 0
+        pr_rate = (prs_created / fixes_generated * 100) if fixes_generated > 0 else 0
+
+        return {
+            "type_counts": type_counts,
+            "daily_counts": daily_counts,
+            "top_agents": top_agents,
+            "metrics": {
+                "issues_detected": issues_detected,
+                "fixes_generated": fixes_generated,
+                "prs_created": prs_created,
+                "fix_rate": round(fix_rate, 1),
+                "pr_rate": round(pr_rate, 1),
+            },
+            "period_days": days,
+        }
 
     # API Key operations
 
@@ -1361,4 +1532,266 @@ class HubDatabase:
             context=context,
             timestamp=datetime.fromisoformat(row["timestamp"]) if row["timestamp"] else None,
             received_at=datetime.fromisoformat(row["received_at"]) if row["received_at"] else None,
+        )
+
+    # Alert operations
+
+    async def create_alert(self, alert: Alert) -> None:
+        """Create a new alert.
+
+        Args:
+            alert: Alert to create
+        """
+        if not self._connection:
+            raise RuntimeError("Database not connected")
+
+        now = datetime.now(timezone.utc).isoformat()
+        triggered = alert.triggered_at.isoformat() if alert.triggered_at else now
+        metadata_json = json.dumps(alert.metadata) if alert.metadata else None
+
+        await self._connection.execute(
+            """INSERT INTO alerts
+               (alert_id, agent_id, alert_type, severity, title, description,
+                triggered_at, acknowledged_at, acknowledged_by, resolved_at, metadata)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                alert.alert_id,
+                alert.agent_id,
+                alert.alert_type,
+                alert.severity,
+                alert.title,
+                alert.description,
+                triggered,
+                alert.acknowledged_at.isoformat() if alert.acknowledged_at else None,
+                alert.acknowledged_by,
+                alert.resolved_at.isoformat() if alert.resolved_at else None,
+                metadata_json,
+            ),
+        )
+        await self._connection.commit()
+        logger.info("alert_created", alert_id=alert.alert_id, alert_type=alert.alert_type)
+
+    async def get_alerts(
+        self,
+        agent_id: str | None = None,
+        alert_type: str | None = None,
+        severity: str | None = None,
+        active_only: bool = False,
+        status: str | None = None,
+        limit: int = 100,
+    ) -> list[Alert]:
+        """Get alerts with optional filters.
+
+        Args:
+            agent_id: Filter by agent
+            alert_type: Filter by alert type
+            severity: Filter by severity
+            active_only: Only return unresolved alerts (deprecated, use status)
+            status: Filter by status: "active" (not acknowledged), "acknowledged", "resolved"
+            limit: Maximum number of alerts to return
+
+        Returns:
+            List of alerts
+        """
+        if not self._connection:
+            raise RuntimeError("Database not connected")
+
+        query = "SELECT * FROM alerts WHERE 1=1"
+        params: list = []
+
+        if agent_id:
+            query += " AND agent_id = ?"
+            params.append(agent_id)
+        if alert_type:
+            query += " AND alert_type = ?"
+            params.append(alert_type)
+        if severity:
+            query += " AND severity = ?"
+            params.append(severity)
+
+        # Status filter takes precedence over active_only
+        if status:
+            if status == "active":
+                query += " AND resolved_at IS NULL AND acknowledged_at IS NULL"
+            elif status == "acknowledged":
+                query += " AND resolved_at IS NULL AND acknowledged_at IS NOT NULL"
+            elif status == "resolved":
+                query += " AND resolved_at IS NOT NULL"
+        elif active_only:
+            query += " AND resolved_at IS NULL"
+
+        query += " ORDER BY triggered_at DESC LIMIT ?"
+        params.append(limit)
+
+        cursor = await self._connection.execute(query, params)
+        rows = await cursor.fetchall()
+
+        return [self._row_to_alert(row) for row in rows]
+
+    async def get_alert(self, alert_id: str) -> Alert | None:
+        """Get a specific alert.
+
+        Args:
+            alert_id: Alert ID
+
+        Returns:
+            Alert if found, None otherwise
+        """
+        if not self._connection:
+            raise RuntimeError("Database not connected")
+
+        cursor = await self._connection.execute(
+            "SELECT * FROM alerts WHERE alert_id = ?",
+            (alert_id,),
+        )
+        row = await cursor.fetchone()
+
+        if not row:
+            return None
+
+        return self._row_to_alert(row)
+
+    async def acknowledge_alert(self, alert_id: str, acknowledged_by: str) -> bool:
+        """Acknowledge an alert.
+
+        Args:
+            alert_id: Alert to acknowledge
+            acknowledged_by: Who acknowledged the alert
+
+        Returns:
+            True if alert was acknowledged
+        """
+        if not self._connection:
+            raise RuntimeError("Database not connected")
+
+        now = datetime.now(timezone.utc).isoformat()
+        cursor = await self._connection.execute(
+            """UPDATE alerts SET acknowledged_at = ?, acknowledged_by = ?
+               WHERE alert_id = ? AND acknowledged_at IS NULL""",
+            (now, acknowledged_by, alert_id),
+        )
+        await self._connection.commit()
+
+        if cursor.rowcount > 0:
+            logger.info("alert_acknowledged", alert_id=alert_id, by=acknowledged_by)
+            return True
+        return False
+
+    async def resolve_alert(self, alert_id: str) -> bool:
+        """Resolve an alert.
+
+        Args:
+            alert_id: Alert to resolve
+
+        Returns:
+            True if alert was resolved
+        """
+        if not self._connection:
+            raise RuntimeError("Database not connected")
+
+        now = datetime.now(timezone.utc).isoformat()
+        cursor = await self._connection.execute(
+            "UPDATE alerts SET resolved_at = ? WHERE alert_id = ? AND resolved_at IS NULL",
+            (now, alert_id),
+        )
+        await self._connection.commit()
+
+        if cursor.rowcount > 0:
+            logger.info("alert_resolved", alert_id=alert_id)
+            return True
+        return False
+
+    async def get_active_alert_for_agent(
+        self,
+        agent_id: str,
+        alert_type: str,
+    ) -> Alert | None:
+        """Get an active (unresolved) alert of a specific type for an agent.
+
+        Used to check if an alert already exists before creating a duplicate.
+
+        Args:
+            agent_id: Agent ID
+            alert_type: Type of alert
+
+        Returns:
+            Alert if found, None otherwise
+        """
+        if not self._connection:
+            raise RuntimeError("Database not connected")
+
+        cursor = await self._connection.execute(
+            """SELECT * FROM alerts
+               WHERE agent_id = ? AND alert_type = ? AND resolved_at IS NULL
+               ORDER BY triggered_at DESC LIMIT 1""",
+            (agent_id, alert_type),
+        )
+        row = await cursor.fetchone()
+
+        if not row:
+            return None
+
+        return self._row_to_alert(row)
+
+    async def get_alert_counts(self) -> dict[str, int]:
+        """Get counts of alerts by status.
+
+        Returns:
+            Dict with active, acknowledged, resolved counts
+        """
+        if not self._connection:
+            raise RuntimeError("Database not connected")
+
+        # Active (unresolved, unacknowledged)
+        cursor = await self._connection.execute(
+            "SELECT COUNT(*) as count FROM alerts WHERE resolved_at IS NULL AND acknowledged_at IS NULL"
+        )
+        row = await cursor.fetchone()
+        active = row["count"] if row else 0
+
+        # Acknowledged but not resolved
+        cursor = await self._connection.execute(
+            "SELECT COUNT(*) as count FROM alerts WHERE resolved_at IS NULL AND acknowledged_at IS NOT NULL"
+        )
+        row = await cursor.fetchone()
+        acknowledged = row["count"] if row else 0
+
+        # Resolved in last 24 hours
+        yesterday = (datetime.now(timezone.utc) - timedelta(hours=24)).isoformat()
+        cursor = await self._connection.execute(
+            "SELECT COUNT(*) as count FROM alerts WHERE resolved_at IS NOT NULL AND resolved_at > ?",
+            (yesterday,),
+        )
+        row = await cursor.fetchone()
+        resolved_24h = row["count"] if row else 0
+
+        return {
+            "active": active,
+            "acknowledged": acknowledged,
+            "resolved_24h": resolved_24h,
+        }
+
+    def _row_to_alert(self, row: aiosqlite.Row) -> Alert:
+        """Convert database row to Alert.
+
+        Args:
+            row: Database row
+
+        Returns:
+            Alert object
+        """
+        metadata = json.loads(row["metadata"]) if row["metadata"] else None
+
+        return Alert(
+            alert_id=row["alert_id"],
+            agent_id=row["agent_id"],
+            alert_type=row["alert_type"],
+            severity=row["severity"],
+            title=row["title"],
+            description=row["description"] or "",
+            triggered_at=datetime.fromisoformat(row["triggered_at"]) if row["triggered_at"] else None,
+            acknowledged_at=datetime.fromisoformat(row["acknowledged_at"]) if row["acknowledged_at"] else None,
+            acknowledged_by=row["acknowledged_by"],
+            resolved_at=datetime.fromisoformat(row["resolved_at"]) if row["resolved_at"] else None,
+            metadata=metadata,
         )
