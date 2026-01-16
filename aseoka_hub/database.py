@@ -698,6 +698,31 @@ class HubDatabase:
 
         return cursor.rowcount > 0
 
+    async def update_agent_callback_url(
+        self,
+        agent_id: str,
+        callback_url: str | None,
+    ) -> bool:
+        """Update agent callback URL.
+
+        Args:
+            agent_id: Agent ID
+            callback_url: New callback URL
+
+        Returns:
+            True if agent exists and was updated
+        """
+        if not self._connection:
+            raise RuntimeError("Database not connected")
+
+        cursor = await self._connection.execute(
+            "UPDATE agents SET callback_url = ? WHERE agent_id = ?",
+            (callback_url, agent_id),
+        )
+        await self._connection.commit()
+
+        return cursor.rowcount > 0
+
     async def get_online_agents(self) -> list[Agent]:
         """Get all online agents.
 

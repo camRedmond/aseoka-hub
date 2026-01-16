@@ -1,15 +1,24 @@
 """Hub server for ASEOKA."""
 
 import asyncio
+import ipaddress
 import json
+import os as _os
 import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from typing import Any, Literal
+from urllib.parse import urlparse
 
 import httpx
 from fastapi import FastAPI, HTTPException, Query, Request, Response, WebSocket, WebSocketDisconnect, status
-from pydantic import BaseModel, Field
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel, Field, field_validator
+from pydantic.functional_validators import AfterValidator
+from slowapi import Limiter, _rate_limit_exceeded_handler
+from slowapi.errors import RateLimitExceeded
+from slowapi.util import get_remote_address
+from typing_extensions import Annotated
 
 from aseoka_hub.logging import get_logger
 from aseoka_hub.types import generate_id
@@ -21,6 +30,96 @@ from aseoka_hub.playbook import PlaybookManager, PlaybookEntry, PlaybookOutcome,
 
 logger = get_logger(__name__)
 
+# =============================================================================
+# Security: Rate Limiting
+# =============================================================================
+
+# Rate limiter setup - uses client IP as key
+limiter = Limiter(key_func=get_remote_address)
+
+# Rate limit configurations (can be overridden via environment)
+RATE_LIMIT_LOGIN = _os.environ.get("ASEOKA_RATE_LIMIT_LOGIN", "5/minute")
+RATE_LIMIT_BOOTSTRAP = _os.environ.get("ASEOKA_RATE_LIMIT_BOOTSTRAP", "10/minute")
+RATE_LIMIT_DEFAULT = _os.environ.get("ASEOKA_RATE_LIMIT_DEFAULT", "60/minute")
+
+
+# =============================================================================
+# Security: SSRF Protection
+# =============================================================================
+
+# Private IP ranges that should be blocked in callback URLs
+PRIVATE_IP_RANGES = [
+    ipaddress.ip_network("10.0.0.0/8"),
+    ipaddress.ip_network("172.16.0.0/12"),
+    ipaddress.ip_network("192.168.0.0/16"),
+    ipaddress.ip_network("127.0.0.0/8"),
+    ipaddress.ip_network("169.254.0.0/16"),  # Link-local / cloud metadata
+    ipaddress.ip_network("0.0.0.0/8"),
+]
+
+
+def validate_callback_url(url: str | None) -> str | None:
+    """Validate callback URL to prevent SSRF attacks.
+
+    Args:
+        url: The callback URL to validate
+
+    Returns:
+        The validated URL if safe, None if empty
+
+    Raises:
+        ValueError: If URL is unsafe (private IP, invalid scheme, etc.)
+    """
+    if not url:
+        return None
+
+    # Enforce length limit
+    if len(url) > 2048:
+        raise ValueError("Callback URL too long (max 2048 characters)")
+
+    try:
+        parsed = urlparse(url)
+    except Exception:
+        raise ValueError("Invalid callback URL format")
+
+    # Validate scheme
+    if parsed.scheme not in ("http", "https"):
+        raise ValueError("Callback URL must use http or https scheme")
+
+    # Validate hostname exists
+    if not parsed.hostname:
+        raise ValueError("Callback URL must have a hostname")
+
+    # Check for private/internal IPs
+    try:
+        # Try to resolve as IP address
+        ip = ipaddress.ip_address(parsed.hostname)
+        for network in PRIVATE_IP_RANGES:
+            if ip in network:
+                raise ValueError(f"Callback URL cannot point to private IP range: {network}")
+    except ValueError as e:
+        if "private IP" in str(e):
+            raise
+        # Not an IP address, it's a hostname - check for localhost variants
+        hostname_lower = parsed.hostname.lower()
+        if hostname_lower in ("localhost", "127.0.0.1", "::1", "0.0.0.0"):
+            raise ValueError("Callback URL cannot point to localhost")
+        # Block common cloud metadata hostnames
+        if hostname_lower in ("metadata.google.internal", "metadata", "169.254.169.254"):
+            raise ValueError("Callback URL cannot point to cloud metadata service")
+
+    return url
+
+
+# =============================================================================
+# Security: WebSocket Connection Limits
+# =============================================================================
+
+# Maximum WebSocket connections
+MAX_AGENT_CONNECTIONS = int(_os.environ.get("ASEOKA_MAX_AGENT_CONNECTIONS", "1000"))
+MAX_DASHBOARD_CONNECTIONS = int(_os.environ.get("ASEOKA_MAX_DASHBOARD_CONNECTIONS", "100"))
+MAX_CONNECTIONS_PER_CLIENT = int(_os.environ.get("ASEOKA_MAX_CONNECTIONS_PER_CLIENT", "50"))
+
 
 # WebSocket connection tracking
 _connected_agents: dict[str, WebSocket] = {}
@@ -31,6 +130,9 @@ _agent_last_seen: dict[str, datetime] = {}
 
 # Cache of agent_id -> client_id for efficient broadcast filtering
 _agent_client_map: dict[str, str] = {}
+
+# Per-client connection counters for limiting
+_client_connection_counts: dict[str, int] = {}
 
 
 # Request/Response models
@@ -46,14 +148,20 @@ class HealthResponse(BaseModel):
 class RegisterAgentRequest(BaseModel):
     """Agent registration request."""
 
-    client_id: str
-    site_url: str
-    site_name: str
-    platform: str | None = None
-    callback_url: str | None = None
+    client_id: str = Field(..., max_length=100)
+    site_url: str = Field(..., max_length=2048)
+    site_name: str = Field(..., max_length=200)
+    platform: str | None = Field(default=None, max_length=100)
+    callback_url: str | None = Field(default=None, max_length=2048)
     has_repo_access: bool = False
     has_github_access: bool = False
-    llm_provider: str = "mock"
+    llm_provider: str = Field(default="mock", max_length=50)
+
+    @field_validator("callback_url")
+    @classmethod
+    def validate_callback(cls, v: str | None) -> str | None:
+        """Validate callback URL to prevent SSRF attacks."""
+        return validate_callback_url(v)
 
 
 class RegisterAgentResponse(BaseModel):
@@ -68,10 +176,10 @@ class RegisterAgentResponse(BaseModel):
 class HeartbeatRequest(BaseModel):
     """Agent heartbeat request."""
 
-    agent_id: str
+    agent_id: str = Field(..., max_length=100)
     health_score: int = Field(default=0, ge=0, le=100)
-    active_issues: int = Field(default=0, ge=0)
-    pending_fixes: int = Field(default=0, ge=0)
+    active_issues: int = Field(default=0, ge=0, le=100000)
+    pending_fixes: int = Field(default=0, ge=0, le=100000)
 
 
 class HeartbeatResponse(BaseModel):
@@ -115,9 +223,10 @@ class ClientResponse(BaseModel):
 class CreateClientRequest(BaseModel):
     """Create client request."""
 
-    client_name: str
-    tier: str = "starter"
-    contact_email: str | None = None
+    client_name: str = Field(..., max_length=200)
+    tier: str = Field(default="starter", max_length=50)
+    contact_email: str | None = Field(default=None, max_length=254)
+    client_id: str | None = Field(default=None, max_length=100)  # Optional custom client_id for devkit
 
 
 # Playbook request/response models
@@ -151,12 +260,12 @@ class PlaybookQueryResponse(BaseModel):
 class PlaybookOutcomeRequest(BaseModel):
     """Playbook outcome request."""
 
-    entry_id: str
-    agent_id: str
-    issue_id: str
+    entry_id: str = Field(..., max_length=100)
+    agent_id: str = Field(..., max_length=100)
+    issue_id: str = Field(..., max_length=100)
     outcome: str = Field(..., pattern="^(success|failure|pending)$")
-    pr_url: str | None = None
-    failure_reason: str | None = None
+    pr_url: str | None = Field(default=None, max_length=2048)
+    failure_reason: str | None = Field(default=None, max_length=1000)
 
 
 class PlaybookOutcomeResponse(BaseModel):
@@ -169,15 +278,15 @@ class PlaybookOutcomeResponse(BaseModel):
 class PlaybookContributeRequest(BaseModel):
     """Playbook contribution request."""
 
-    issue_type: str
-    category: str
-    severity: str
-    title: str
-    fix_description: str
-    fix_steps: list[str]
-    contributed_by: str
-    patterns: list[str] | None = None
-    anti_patterns: list[str] | None = None
+    issue_type: str = Field(..., max_length=100)
+    category: str = Field(..., max_length=100)
+    severity: str = Field(..., max_length=50)
+    title: str = Field(..., max_length=500)
+    fix_description: str = Field(..., max_length=5000)
+    fix_steps: list[str] = Field(..., max_length=50)  # Max 50 steps
+    contributed_by: str = Field(..., max_length=100)
+    patterns: list[str] | None = Field(default=None, max_length=50)
+    anti_patterns: list[str] | None = Field(default=None, max_length=50)
 
 
 # WebSocket message types
@@ -576,7 +685,6 @@ async def lifespan(app: FastAPI):
 
 # Create FastAPI app
 # Docs are disabled by default for security - set ASEOKA_HUB_DOCS_ENABLED=true in dev
-import os as _os
 _docs_enabled = _os.environ.get("ASEOKA_HUB_DOCS_ENABLED", "false").lower() == "true"
 
 app = FastAPI(
@@ -587,6 +695,28 @@ app = FastAPI(
     docs_url="/docs" if _docs_enabled else None,
     redoc_url="/redoc" if _docs_enabled else None,
     openapi_url="/openapi.json" if _docs_enabled else None,
+)
+
+# =============================================================================
+# Security: Rate Limiting Setup
+# =============================================================================
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+
+# =============================================================================
+# Security: CORS Configuration
+# =============================================================================
+# Get allowed origins from environment (comma-separated list)
+_cors_origins_str = _os.environ.get("ASEOKA_HUB_CORS_ORIGINS", "http://localhost:3000,http://localhost:3002")
+_cors_origins = [origin.strip() for origin in _cors_origins_str.split(",") if origin.strip()]
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=_cors_origins,
+    allow_credentials=True,
+    allow_methods=["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"],
+    allow_headers=["*"],
+    expose_headers=["X-Request-ID", "X-RateLimit-Limit", "X-RateLimit-Remaining", "X-RateLimit-Reset"],
 )
 
 # Add authentication middleware
@@ -617,8 +747,19 @@ async def create_client(request: CreateClientRequest) -> ClientResponse:
     """Create a new client."""
     db = get_db()
 
+    # Use custom client_id if provided, otherwise generate one
+    client_id = request.client_id or generate_id("client")
+
+    # Check if client already exists
+    existing = await db.get_client(client_id)
+    if existing:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"Client {client_id} already exists",
+        )
+
     client = Client(
-        client_id=generate_id("client"),
+        client_id=client_id,
         client_name=request.client_name,
         tier=request.tier,
         contact_email=request.contact_email,
@@ -663,40 +804,44 @@ async def get_client(client_id: str) -> ClientResponse:
 # Agent registration endpoints
 
 @app.post("/agents/register", response_model=RegisterAgentResponse, status_code=status.HTTP_201_CREATED)
-async def register_agent(request: RegisterAgentRequest) -> RegisterAgentResponse:
+@limiter.limit(RATE_LIMIT_BOOTSTRAP)  # Same limit as bootstrap - registration is sensitive
+async def register_agent(request: Request, request_body: RegisterAgentRequest) -> RegisterAgentResponse:
     """Register a new agent or reconnect an existing one."""
     db = get_db()
 
     # Verify client exists
-    client = await db.get_client(request.client_id)
+    client = await db.get_client(request_body.client_id)
     if not client:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Client {request.client_id} not found",
+            detail=f"Client {request_body.client_id} not found",
         )
 
     # Check if an agent for this (client_id, site_url) already exists
-    existing_agents = await db.get_agents_by_client(request.client_id)
+    existing_agents = await db.get_agents_by_client(request_body.client_id)
     existing_agent = next(
-        (a for a in existing_agents if a.site_url == request.site_url),
+        (a for a in existing_agents if a.site_url == request_body.site_url),
         None
     )
 
     if existing_agent:
-        # Reconnect existing agent - update status to online
+        # Reconnect existing agent - update status to online and callback_url
         await db.update_agent_status(existing_agent.agent_id, "online")
+        if request_body.callback_url:
+            await db.update_agent_callback_url(existing_agent.agent_id, request_body.callback_url)
 
         logger.info(
             "agent_reconnected",
             agent_id=existing_agent.agent_id,
-            client_id=request.client_id,
-            site_url=request.site_url,
+            client_id=request_body.client_id,
+            site_url=request_body.site_url,
+            callback_url=request_body.callback_url,
         )
 
         return RegisterAgentResponse(
             agent_id=existing_agent.agent_id,
-            client_id=request.client_id,
-            site_url=request.site_url,
+            client_id=request_body.client_id,
+            site_url=request_body.site_url,
             registered_at=existing_agent.registered_at.isoformat() if existing_agent.registered_at else datetime.now(timezone.utc).isoformat(),
         )
 
@@ -713,16 +858,16 @@ async def register_agent(request: RegisterAgentRequest) -> RegisterAgentResponse
 
     agent = Agent(
         agent_id=agent_id,
-        client_id=request.client_id,
-        site_url=request.site_url,
-        site_name=request.site_name,
-        platform=request.platform,
+        client_id=request_body.client_id,
+        site_url=request_body.site_url,
+        site_name=request_body.site_name,
+        platform=request_body.platform,
         tier=client.tier,
         status="online",
-        callback_url=request.callback_url,
-        has_repo_access=request.has_repo_access,
-        has_github_access=request.has_github_access,
-        llm_provider=request.llm_provider,
+        callback_url=request_body.callback_url,
+        has_repo_access=request_body.has_repo_access,
+        has_github_access=request_body.has_github_access,
+        llm_provider=request_body.llm_provider,
     )
 
     await db.register_agent(agent)
@@ -733,21 +878,21 @@ async def register_agent(request: RegisterAgentRequest) -> RegisterAgentResponse
             activity_id=generate_id("activity"),
             agent_id=agent_id,
             activity_type="agent_registered",
-            description=f"Agent registered for {request.site_url}",
+            description=f"Agent registered for {request_body.site_url}",
         )
     )
 
     logger.info(
         "agent_registered_via_api",
         agent_id=agent_id,
-        client_id=request.client_id,
-        site_url=request.site_url,
+        client_id=request_body.client_id,
+        site_url=request_body.site_url,
     )
 
     return RegisterAgentResponse(
         agent_id=agent_id,
-        client_id=request.client_id,
-        site_url=request.site_url,
+        client_id=request_body.client_id,
+        site_url=request_body.site_url,
         registered_at=now.isoformat(),
     )
 
@@ -855,31 +1000,32 @@ async def list_agents(
 # Heartbeat endpoints
 
 @app.post("/agents/heartbeat", response_model=HeartbeatResponse)
-async def heartbeat(request: HeartbeatRequest) -> HeartbeatResponse:
+@limiter.limit("120/minute")  # Higher limit for heartbeat - agents call this frequently
+async def heartbeat(request: Request, request_body: HeartbeatRequest) -> HeartbeatResponse:
     """Process agent heartbeat."""
     db = get_db()
 
     updated = await db.update_heartbeat(
-        request.agent_id,
-        request.health_score,
-        active_issues=request.active_issues,
-        pending_fixes=request.pending_fixes,
+        request_body.agent_id,
+        request_body.health_score,
+        active_issues=request_body.active_issues,
+        pending_fixes=request_body.pending_fixes,
     )
 
     if not updated:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Agent {request.agent_id} not found",
+            detail=f"Agent {request_body.agent_id} not found",
         )
 
     # Broadcast state update to connected dashboards
     await broadcast_to_dashboards({
         "type": "agent_state_update",
-        "agent_id": request.agent_id,
+        "agent_id": request_body.agent_id,
         "data": {
-            "health_score": request.health_score,
-            "active_issues": request.active_issues,
-            "pending_fixes": request.pending_fixes,
+            "health_score": request_body.health_score,
+            "active_issues": request_body.active_issues,
+            "pending_fixes": request_body.pending_fixes,
         },
         "timestamp": datetime.now(timezone.utc).isoformat(),
     })
@@ -1405,7 +1551,8 @@ async def get_install_script(
 
 
 @app.post("/bootstrap", response_model=BootstrapResponse)
-async def bootstrap_agent(request: BootstrapRequest) -> BootstrapResponse:
+@limiter.limit(RATE_LIMIT_BOOTSTRAP)
+async def bootstrap_agent(request: Request, request_body: BootstrapRequest) -> BootstrapResponse:
     """Bootstrap a new agent with credentials.
 
     This endpoint is called by the install script to provision a new agent.
@@ -1420,7 +1567,7 @@ async def bootstrap_agent(request: BootstrapRequest) -> BootstrapResponse:
     settings = get_settings()
 
     # Validate provisioning token
-    token_hash = hash_provisioning_token(request.provisioning_token)
+    token_hash = hash_provisioning_token(request_body.provisioning_token)
     prov_token = await db.get_provisioning_token(token_hash)
 
     if not prov_token:
@@ -1465,9 +1612,9 @@ async def bootstrap_agent(request: BootstrapRequest) -> BootstrapResponse:
     agent = Agent(
         agent_id=agent_id,
         client_id=prov_token.client_id,
-        site_url=request.site_url,
-        site_name=request.site_name,
-        platform=request.platform,
+        site_url=request_body.site_url,
+        site_name=request_body.site_name,
+        platform=request_body.platform,
         tier=prov_token.tier,
         status="provisioned",
     )
@@ -2489,12 +2636,41 @@ async def agent_websocket(
         await websocket.close(code=1008, reason="Agent not found")
         return
 
+    # ==========================================================================
+    # Security: Connection Limits
+    # ==========================================================================
+    # Check global agent connection limit
+    if len(_connected_agents) >= MAX_AGENT_CONNECTIONS:
+        logger.warning(
+            "ws_connection_limit_reached",
+            limit=MAX_AGENT_CONNECTIONS,
+            agent_id=agent_id,
+        )
+        await websocket.close(code=1013, reason="Server at maximum capacity")
+        return
+
+    # Check per-client connection limit
+    client_id = agent.client_id
+    current_client_connections = _client_connection_counts.get(client_id, 0)
+    if current_client_connections >= MAX_CONNECTIONS_PER_CLIENT:
+        logger.warning(
+            "ws_client_connection_limit_reached",
+            limit=MAX_CONNECTIONS_PER_CLIENT,
+            client_id=client_id,
+            agent_id=agent_id,
+        )
+        await websocket.close(code=1013, reason="Client connection limit reached")
+        return
+
     # Accept connection
     await websocket.accept()
 
     # Register connection and cache client_id for broadcast filtering
     _connected_agents[agent_id] = websocket
     _agent_last_seen[agent_id] = datetime.now(timezone.utc)
+
+    # Increment client connection count
+    _client_connection_counts[client_id] = _client_connection_counts.get(client_id, 0) + 1
     _agent_client_map[agent_id] = agent.client_id
 
     # Update agent status
@@ -2516,11 +2692,36 @@ async def agent_websocket(
 
     logger.info("agent_ws_connected", agent_id=agent_id)
 
+    json_error_count = 0
+    MAX_JSON_ERRORS = 5  # Close connection after too many parse failures
+
     try:
         while True:
             # Receive message
             data = await websocket.receive_text()
-            msg = json.loads(data)
+
+            # Parse JSON with error handling to prevent crashes from malformed input
+            try:
+                msg = json.loads(data)
+            except json.JSONDecodeError as e:
+                json_error_count += 1
+                logger.warning(
+                    "ws_json_parse_error",
+                    agent_id=agent_id,
+                    error=str(e),
+                    error_count=json_error_count,
+                )
+                # Send error response
+                await websocket.send_text(json.dumps({
+                    "type": "error",
+                    "data": {"message": "Invalid JSON format", "error": str(e)},
+                }))
+                # Close connection after too many errors to prevent abuse
+                if json_error_count >= MAX_JSON_ERRORS:
+                    await websocket.close(code=1008, reason="Too many JSON parse errors")
+                    return
+                continue
+
             msg_type = msg.get("type", "unknown")
             msg_data = msg.get("data", {})
 
@@ -2638,9 +2839,18 @@ async def agent_websocket(
     except Exception as e:
         logger.error("agent_ws_error", agent_id=agent_id, error=str(e))
     finally:
+        # Get client_id before cleanup for connection count decrement
+        cleanup_client_id = _agent_client_map.get(agent_id)
+
         # Cleanup connection (keep client_id for disconnect broadcast)
         _connected_agents.pop(agent_id, None)
         _agent_last_seen.pop(agent_id, None)
+
+        # Decrement client connection count
+        if cleanup_client_id and cleanup_client_id in _client_connection_counts:
+            _client_connection_counts[cleanup_client_id] = max(
+                0, _client_connection_counts[cleanup_client_id] - 1
+            )
 
         # Update agent status
         try:
@@ -2711,6 +2921,19 @@ async def dashboard_websocket(
             await websocket.close(code=1008, reason="Token missing client_id claim")
             return
 
+    # ==========================================================================
+    # Security: Connection Limits
+    # ==========================================================================
+    # Check global dashboard connection limit
+    if len(_dashboard_subscribers) >= MAX_DASHBOARD_CONNECTIONS:
+        logger.warning(
+            "dashboard_ws_connection_limit_reached",
+            limit=MAX_DASHBOARD_CONNECTIONS,
+            client_id=client_id,
+        )
+        await websocket.close(code=1013, reason="Server at maximum dashboard capacity")
+        return
+
     # Accept connection and register with client info
     await websocket.accept()
     _dashboard_subscribers[websocket] = {
@@ -2772,6 +2995,9 @@ async def dashboard_websocket(
         }))
 
         # Keep connection alive
+        json_error_count = 0
+        MAX_JSON_ERRORS = 5  # Close connection after too many parse failures
+
         while True:
             try:
                 # Wait for ping/pong or client messages
@@ -2780,7 +3006,26 @@ async def dashboard_websocket(
                     timeout=30.0,  # Ping every 30 seconds
                 )
 
-                msg = json.loads(data)
+                # Parse JSON with error handling
+                try:
+                    msg = json.loads(data)
+                except json.JSONDecodeError as e:
+                    json_error_count += 1
+                    logger.warning(
+                        "dashboard_ws_json_parse_error",
+                        client_id=client_id,
+                        error=str(e),
+                        error_count=json_error_count,
+                    )
+                    await websocket.send_text(json.dumps({
+                        "type": "error",
+                        "data": {"message": "Invalid JSON format", "error": str(e)},
+                    }))
+                    if json_error_count >= MAX_JSON_ERRORS:
+                        await websocket.close(code=1008, reason="Too many JSON parse errors")
+                        return
+                    continue
+
                 msg_type = msg.get("type")
 
                 if msg_type == "ping":
