@@ -80,6 +80,23 @@ class APIKey:
 
 
 @dataclass
+class User:
+    """Dashboard user for email/password authentication."""
+
+    user_id: str
+    client_id: str  # FK to clients
+    email: str
+    password_hash: str  # bcrypt with cost 12
+    name: str
+    is_admin: bool = False
+    is_active: bool = True
+    failed_login_attempts: int = 0  # For account lockout
+    locked_until: datetime | None = None  # Lockout expiry
+    created_at: datetime | None = None
+    last_login_at: datetime | None = None
+
+
+@dataclass
 class Certificate:
     """Agent certificate for mTLS."""
 
@@ -255,6 +272,21 @@ CREATE TABLE IF NOT EXISTS alerts (
     metadata TEXT
 );
 
+-- Dashboard users for email/password authentication
+CREATE TABLE IF NOT EXISTS users (
+    user_id TEXT PRIMARY KEY,
+    client_id TEXT NOT NULL REFERENCES clients(client_id),
+    email TEXT UNIQUE NOT NULL,
+    password_hash TEXT NOT NULL,
+    name TEXT NOT NULL,
+    is_admin INTEGER DEFAULT 0,
+    is_active INTEGER DEFAULT 1,
+    failed_login_attempts INTEGER DEFAULT 0,
+    locked_until TIMESTAMP,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    last_login_at TIMESTAMP
+);
+
 -- Create indexes
 CREATE INDEX IF NOT EXISTS idx_agents_client ON agents(client_id);
 CREATE INDEX IF NOT EXISTS idx_agents_status ON agents(status);
@@ -271,6 +303,8 @@ CREATE INDEX IF NOT EXISTS idx_alerts_agent ON alerts(agent_id);
 CREATE INDEX IF NOT EXISTS idx_alerts_type ON alerts(alert_type);
 CREATE INDEX IF NOT EXISTS idx_alerts_severity ON alerts(severity);
 CREATE INDEX IF NOT EXISTS idx_alerts_resolved ON alerts(resolved_at);
+CREATE INDEX IF NOT EXISTS idx_users_email ON users(email);
+CREATE INDEX IF NOT EXISTS idx_users_client ON users(client_id);
 """
 
 
@@ -1819,4 +1853,180 @@ class HubDatabase:
             acknowledged_by=row["acknowledged_by"],
             resolved_at=datetime.fromisoformat(row["resolved_at"]) if row["resolved_at"] else None,
             metadata=metadata,
+        )
+
+    # User operations
+
+    async def create_user(self, user: User) -> None:
+        """Create a new user.
+
+        Args:
+            user: User to create
+        """
+        if not self._connection:
+            raise RuntimeError("Database not connected")
+
+        now = datetime.now(timezone.utc).isoformat()
+        await self._connection.execute(
+            """INSERT INTO users
+               (user_id, client_id, email, password_hash, name, is_admin, is_active,
+                failed_login_attempts, locked_until, created_at, last_login_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                user.user_id,
+                user.client_id,
+                user.email.lower(),  # Normalize email to lowercase
+                user.password_hash,
+                user.name,
+                1 if user.is_admin else 0,
+                1 if user.is_active else 0,
+                user.failed_login_attempts,
+                user.locked_until.isoformat() if user.locked_until else None,
+                now,
+                None,
+            ),
+        )
+        await self._connection.commit()
+        logger.info("user_created", user_id=user.user_id, email=user.email)
+
+    async def get_user_by_email(self, email: str) -> User | None:
+        """Get a user by email address.
+
+        Args:
+            email: Email address (case-insensitive)
+
+        Returns:
+            User or None if not found
+        """
+        if not self._connection:
+            raise RuntimeError("Database not connected")
+
+        cursor = await self._connection.execute(
+            "SELECT * FROM users WHERE email = ?",
+            (email.lower(),),
+        )
+        row = await cursor.fetchone()
+
+        if not row:
+            return None
+
+        return self._row_to_user(row)
+
+    async def get_user(self, user_id: str) -> User | None:
+        """Get a user by ID.
+
+        Args:
+            user_id: User ID
+
+        Returns:
+            User or None if not found
+        """
+        if not self._connection:
+            raise RuntimeError("Database not connected")
+
+        cursor = await self._connection.execute(
+            "SELECT * FROM users WHERE user_id = ?",
+            (user_id,),
+        )
+        row = await cursor.fetchone()
+
+        if not row:
+            return None
+
+        return self._row_to_user(row)
+
+    async def update_user_last_login(self, user_id: str) -> bool:
+        """Update last login timestamp and reset failed login attempts.
+
+        Args:
+            user_id: User ID
+
+        Returns:
+            True if user was updated
+        """
+        if not self._connection:
+            raise RuntimeError("Database not connected")
+
+        now = datetime.now(timezone.utc).isoformat()
+        cursor = await self._connection.execute(
+            """UPDATE users
+               SET last_login_at = ?, failed_login_attempts = 0, locked_until = NULL
+               WHERE user_id = ?""",
+            (now, user_id),
+        )
+        await self._connection.commit()
+
+        return cursor.rowcount > 0
+
+    async def increment_failed_login(self, user_id: str) -> int:
+        """Increment failed login counter and lock account if >= 5 attempts.
+
+        Args:
+            user_id: User ID
+
+        Returns:
+            New failed login count
+        """
+        if not self._connection:
+            raise RuntimeError("Database not connected")
+
+        # Get current count
+        cursor = await self._connection.execute(
+            "SELECT failed_login_attempts FROM users WHERE user_id = ?",
+            (user_id,),
+        )
+        row = await cursor.fetchone()
+        if not row:
+            return 0
+
+        new_count = row["failed_login_attempts"] + 1
+
+        # Lock account for 15 minutes if >= 5 failed attempts
+        locked_until = None
+        if new_count >= 5:
+            locked_until = (datetime.now(timezone.utc) + timedelta(minutes=15)).isoformat()
+            logger.warning("user_account_locked", user_id=user_id, locked_until=locked_until)
+
+        await self._connection.execute(
+            "UPDATE users SET failed_login_attempts = ?, locked_until = ? WHERE user_id = ?",
+            (new_count, locked_until, user_id),
+        )
+        await self._connection.commit()
+
+        return new_count
+
+    async def get_user_count(self) -> int:
+        """Get total number of users.
+
+        Returns:
+            Number of users in database
+        """
+        if not self._connection:
+            raise RuntimeError("Database not connected")
+
+        cursor = await self._connection.execute("SELECT COUNT(*) as count FROM users")
+        row = await cursor.fetchone()
+        return row["count"] if row else 0
+
+    def _row_to_user(self, row: aiosqlite.Row) -> User:
+        """Convert database row to User.
+
+        Args:
+            row: Database row
+
+        Returns:
+            User object
+        """
+        return User(
+            user_id=row["user_id"],
+            client_id=row["client_id"],
+            email=row["email"],
+            password_hash=row["password_hash"],
+            name=row["name"],
+            is_admin=bool(row["is_admin"]),
+            is_active=bool(row["is_active"]),
+            failed_login_attempts=row["failed_login_attempts"] or 0,
+            locked_until=datetime.fromisoformat(row["locked_until"]) if row["locked_until"] else None,
+            created_at=datetime.fromisoformat(row["created_at"]) if row["created_at"] else None,
+            last_login_at=datetime.fromisoformat(row["last_login_at"]) if row["last_login_at"] else None,
         )

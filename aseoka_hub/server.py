@@ -23,7 +23,7 @@ from typing_extensions import Annotated
 from aseoka_hub.logging import get_logger
 from aseoka_hub.types import generate_id
 from aseoka_hub.auth import AuthInfo, TokenManager
-from aseoka_hub.database import HubDatabase, Agent, Client, Activity, Alert
+from aseoka_hub.database import HubDatabase, Agent, Client, Activity, Alert, User
 from aseoka_hub.health_monitor import HealthMonitor
 from aseoka_hub.middleware import AuthMiddleware, get_auth_info
 from aseoka_hub.playbook import PlaybookManager, PlaybookEntry, PlaybookOutcome, CodeExample
@@ -376,6 +376,47 @@ class CreateProvisioningTokenRequest(BaseModel):
     tier: str = "starter"
     max_agents: int = 1
     expires_hours: int = 24
+
+
+# User authentication models
+
+class UserLoginRequest(BaseModel):
+    """User login request."""
+
+    email: str = Field(..., max_length=254)
+    password: str = Field(..., min_length=8, max_length=128)
+
+
+class UserLoginResponse(BaseModel):
+    """User login response."""
+
+    access_token: str
+    token_type: str = "bearer"
+    expires_in: int
+    user_id: str
+    client_id: str
+    is_admin: bool
+    name: str
+
+
+class UserRegisterRequest(BaseModel):
+    """User registration request."""
+
+    email: str = Field(..., max_length=254)
+    password: str = Field(..., min_length=8, max_length=128)
+    name: str = Field(..., min_length=1, max_length=200)
+    client_id: str = Field(..., max_length=100)
+    is_admin: bool = False
+
+
+class UserResponse(BaseModel):
+    """User details response."""
+
+    user_id: str
+    client_id: str
+    email: str
+    name: str
+    is_admin: bool
 
 
 class ProvisioningTokenResponse(BaseModel):
@@ -738,6 +779,245 @@ async def health_check() -> HealthResponse:
 async def root() -> HealthResponse:
     """Root endpoint."""
     return await health_check()
+
+
+# =============================================================================
+# User Authentication Endpoints
+# =============================================================================
+
+@app.post("/auth/login", response_model=UserLoginResponse)
+@limiter.limit(RATE_LIMIT_LOGIN)
+async def user_login(request: Request, body: UserLoginRequest) -> UserLoginResponse:
+    """Authenticate a user with email and password.
+
+    Returns a JWT token for subsequent API calls.
+
+    Security measures:
+    - Rate limited to 5 requests/minute per IP
+    - Account lockout after 5 failed attempts (15 minute lockout)
+    - Generic error messages to prevent user enumeration
+    - bcrypt password verification with constant-time comparison
+    """
+    import bcrypt
+    import secrets
+
+    db = get_db()
+    settings = get_settings()
+
+    # Generic error message for all auth failures (prevents user enumeration)
+    auth_error = HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail="Invalid credentials",
+    )
+
+    # Find user by email
+    user = await db.get_user_by_email(body.email)
+
+    if not user:
+        # Perform dummy bcrypt check to prevent timing attacks
+        bcrypt.checkpw(b"dummy", bcrypt.gensalt())
+        raise auth_error
+
+    # Check if account is locked
+    if user.locked_until:
+        if datetime.now(timezone.utc) < user.locked_until:
+            raise HTTPException(
+                status_code=status.HTTP_423_LOCKED,
+                detail="Account temporarily locked due to too many failed attempts",
+            )
+
+    # Verify password using bcrypt
+    if not bcrypt.checkpw(body.password.encode(), user.password_hash.encode()):
+        # Increment failed login counter (may lock account)
+        await db.increment_failed_login(user.user_id)
+        logger.warning("login_failed", email=body.email, reason="invalid_password")
+        raise auth_error
+
+    # Check if user is active
+    if not user.is_active:
+        raise auth_error
+
+    # Successful login - update last login and reset failed attempts
+    await db.update_user_last_login(user.user_id)
+
+    # Create JWT token
+    token_manager = TokenManager(settings.hub_jwt_secret, expiry_minutes=60)
+    access_token = token_manager.create_user_token(
+        user_id=user.user_id,
+        client_id=user.client_id,
+        is_admin=user.is_admin,
+    )
+
+    logger.info("user_login_success", user_id=user.user_id, email=body.email)
+
+    return UserLoginResponse(
+        access_token=access_token,
+        token_type="bearer",
+        expires_in=3600,  # 1 hour
+        user_id=user.user_id,
+        client_id=user.client_id,
+        is_admin=user.is_admin,
+        name=user.name,
+    )
+
+
+@app.post("/auth/register", response_model=UserResponse, status_code=status.HTTP_201_CREATED)
+@limiter.limit(RATE_LIMIT_LOGIN)
+async def user_register(request: Request, body: UserRegisterRequest) -> UserResponse:
+    """Register a new user.
+
+    Requires admin authentication, unless this is the first user in the system.
+    The first user is automatically created as an admin.
+    """
+    import bcrypt
+
+    db = get_db()
+
+    # Check if this is the first user (bootstrap case)
+    user_count = await db.get_user_count()
+    is_first_user = user_count == 0
+
+    if not is_first_user:
+        # Require admin auth for subsequent user creation
+        auth_info = get_auth_info(request)
+        if not auth_info or not auth_info.is_admin:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Admin authentication required to register new users",
+            )
+
+    # Verify client exists
+    client = await db.get_client(body.client_id)
+    if not client:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Client {body.client_id} not found",
+        )
+
+    # Check email uniqueness (case-insensitive)
+    existing_user = await db.get_user_by_email(body.email)
+    if existing_user:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Email already registered",
+        )
+
+    # Hash password with bcrypt (cost factor 12)
+    password_hash = bcrypt.hashpw(body.password.encode(), bcrypt.gensalt(rounds=12)).decode()
+
+    # First user is automatically an admin
+    is_admin = body.is_admin or is_first_user
+
+    # Create user
+    user = User(
+        user_id=generate_id("user"),
+        client_id=body.client_id,
+        email=body.email,
+        password_hash=password_hash,
+        name=body.name,
+        is_admin=is_admin,
+    )
+
+    await db.create_user(user)
+
+    logger.info(
+        "user_registered",
+        user_id=user.user_id,
+        email=body.email,
+        is_admin=is_admin,
+        is_first_user=is_first_user,
+    )
+
+    return UserResponse(
+        user_id=user.user_id,
+        client_id=user.client_id,
+        email=user.email,
+        name=user.name,
+        is_admin=user.is_admin,
+    )
+
+
+@app.get("/auth/me", response_model=UserResponse)
+async def get_current_user(request: Request) -> UserResponse:
+    """Get the current authenticated user's information."""
+    auth_info = get_auth_info(request)
+
+    if not auth_info or not auth_info.user_id:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Authentication required",
+        )
+
+    db = get_db()
+    user = await db.get_user(auth_info.user_id)
+
+    if not user:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="User not found",
+        )
+
+    return UserResponse(
+        user_id=user.user_id,
+        client_id=user.client_id,
+        email=user.email,
+        name=user.name,
+        is_admin=user.is_admin,
+    )
+
+
+@app.post("/auth/validate")
+async def validate_api_key(request: Request) -> dict:
+    """Validate an API key and return a JWT token.
+
+    This endpoint allows API key holders to exchange their key for a JWT token.
+    Primarily used by the dashboard for initial authentication.
+    """
+    from aseoka_hub.auth import extract_api_key, verify_api_key_with_bcrypt
+
+    db = get_db()
+    settings = get_settings()
+
+    # Extract API key from headers
+    headers = {k.lower(): v for k, v in request.headers.items()}
+    api_key = extract_api_key(headers)
+
+    if not api_key:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="API key required",
+        )
+
+    # Verify API key
+    auth_info = await verify_api_key_with_bcrypt(api_key, db)
+
+    if not auth_info:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid API key",
+        )
+
+    # Get client_id from agent if available
+    client_id = None
+    if auth_info.agent_id:
+        agent = await db.get_agent(auth_info.agent_id)
+        if agent:
+            client_id = agent.client_id
+
+    # Create JWT token
+    token_manager = TokenManager(settings.hub_jwt_secret, expiry_minutes=60)
+    access_token = token_manager.create_dashboard_token(
+        client_id=client_id or "admin",
+        permissions=auth_info.permissions,
+    )
+
+    return {
+        "access_token": access_token,
+        "token_type": "bearer",
+        "expires_in": 3600,
+        "agent_id": auth_info.agent_id,
+        "client_id": client_id,
+    }
 
 
 # Client endpoints

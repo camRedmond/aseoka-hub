@@ -20,6 +20,7 @@ class AuthInfo:
 
     agent_id: str | None
     client_id: str | None = None  # For dashboard/multi-tenant auth
+    user_id: str | None = None  # For dashboard user auth
     key_id: str | None = None
     cert_cn: str | None = None
     auth_method: str = "none"  # api_key, mtls, jwt, none
@@ -124,6 +125,34 @@ class TokenManager:
             extra_claims={"type": "dashboard"},
         )
 
+    def create_user_token(
+        self,
+        user_id: str,
+        client_id: str,
+        is_admin: bool = False,
+    ) -> str:
+        """Create a JWT token for a dashboard user.
+
+        Args:
+            user_id: User ID (becomes 'sub' claim)
+            client_id: Client ID for multi-tenant filtering
+            is_admin: Whether user has admin privileges
+
+        Returns:
+            Encoded JWT token
+        """
+        permissions = ["dashboard", "admin"] if is_admin else ["dashboard"]
+        now = datetime.now(timezone.utc)
+        payload = {
+            "sub": user_id,
+            "client_id": client_id,
+            "type": "user",
+            "iat": now,
+            "exp": now + timedelta(minutes=self.expiry_minutes),
+            "permissions": permissions,
+        }
+        return jwt.encode(payload, self.secret, algorithm="HS256")
+
     def verify_token(self, token: str) -> AuthInfo | None:
         """Verify a JWT token and return auth info.
 
@@ -136,10 +165,20 @@ class TokenManager:
         try:
             payload = jwt.decode(token, self.secret, algorithms=["HS256"])
             permissions = payload.get("permissions", [])
+            token_type = payload.get("type")
+
+            # For user tokens, extract user_id from sub
+            user_id = None
+            agent_id = None
+            if token_type == "user":
+                user_id = payload.get("sub")
+            else:
+                agent_id = payload.get("sub")
 
             return AuthInfo(
-                agent_id=payload.get("sub"),
+                agent_id=agent_id,
                 client_id=payload.get("client_id"),
+                user_id=user_id,
                 auth_method="jwt",
                 permissions=permissions,
                 is_admin="admin" in permissions,
