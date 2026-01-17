@@ -246,6 +246,10 @@ class GeneratedFix:
     explanation: str = ""
     sandbox_validated: bool = False
     created_at: datetime = field(default_factory=datetime.utcnow)
+    # Batch tracking for multi-file fixes
+    total_affected_files: int = 0  # Total files affected by the issue
+    batch_number: int = 1  # Which batch this fix is (1, 2, 3...)
+    files_remaining: int = 0  # Files still needing fixes after this batch
 
 
 @dataclass
